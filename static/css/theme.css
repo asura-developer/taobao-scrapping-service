@@ -1,0 +1,46 @@
+/* ══════════════════════════════════════════════════════════════
+   Theme — CSS custom properties, base reset, typography
+   ══════════════════════════════════════════════════════════════ */
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+    --bg:        #0a0b0d;
+    --surface:   #111318;
+    --surface2:  #181c22;
+    --surface3:  #1e2229;
+    --border:    #252a33;
+    --border2:   #2f3640;
+    --amber:     #f0a500;
+    --amber-l:   #fbbf24;
+    --amber-dim: #7a5200;
+    --green:     #16a34a;
+    --green-l:   #22c55e;
+    --red:       #dc2626;
+    --red-l:     #f87171;
+    --blue:      #2563eb;
+    --blue-l:    #60a5fa;
+    --text:      #dde1e7;
+    --text2:     #a0a8b5;
+    --muted:     #5c6470;
+    --mono:      'IBM Plex Mono', monospace;
+    --sans:      'IBM Plex Sans', sans-serif;
+    --radius:    6px;
+    --sidebar-w: 220px;
+}
+
+html, body { height: 100%; }
+body {
+    background: var(--bg); color: var(--text); font-family: var(--sans);
+    font-size: 14px; line-height: 1.6; display: flex; overflow: hidden; height: 100vh;
+}
+
+/* ── Animations ── */
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.35} }
+@keyframes shimmer { 0%{background-position:200% 0} 100%{background-position:-200% 0} }
+@keyframes fadein { from{opacity:0;transform:translateY(4px)} to{opacity:1;transform:none} }
+@keyframes modal-in { from{opacity:0;transform:translateY(-10px)} to{opacity:1;transform:none} }
+@keyframes toast-in { from{opacity:0;transform:translateX(40px)} to{opacity:1;transform:none} }
+@keyframes toast-out { from{opacity:1;transform:none} to{opacity:0;transform:translateX(40px)} }
+
+.fade-in { animation: fadein 0.25s ease; }

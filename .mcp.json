@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "ScraplingServer": {
+      "command": "/Users/vanra/PycharmProjects/scrape-ai/.venv/bin/scrapling",
+      "args": ["mcp"]
+    }
+  }
+}

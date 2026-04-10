@@ -1,0 +1,31 @@
+# Environment
+.env
+*.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+scrapling-env/
+
+# Data & debug
+data/
+debug_*.json
+scraped_html/
+
+# Browser
+utils/browser-data/
+utils/cookies.json
+utils/cookies-1688.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

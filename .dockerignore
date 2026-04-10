@@ -1,0 +1,37 @@
+# Virtual environments
+.venv/
+scrapling-env/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Environment files (injected at runtime)
+.env
+
+# Debug dumps
+debug_*.json
+
+# Git
+.git/
+.gitignore
+
+# Test files
+tests/
+pytest.ini
+
+# Data directory (optional — remove if you want pre-seeded data in the image)
+data/
+
+# Dev scripts
+debug_cards.py
+debug_taobao.py
+scripts/
+
+# Misc
+*.md

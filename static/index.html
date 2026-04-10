@@ -1,0 +1,1919 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Scraper OS</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/css/theme.css">
+    <link rel="stylesheet" href="/static/css/layout.css">
+    <link rel="stylesheet" href="/static/css/components.css">
+</head>
+<body>
+
+<aside class="sidebar">
+    <div class="sidebar-brand">
+        <div class="brand-icon">🕷</div>
+        <div><div class="brand-name">Scraper OS</div><div class="brand-sub">Data Pipeline</div></div>
+    </div>
+    <nav class="sidebar-nav">
+        <div class="nav-section">Operations</div>
+        <button class="nav-item active" onclick="switchTab(this,'scrape')"><span class="nav-icon">＋</span> New Job</button>
+        <button class="nav-item" onclick="switchTab(this,'batch')"><span class="nav-icon">📋</span> Batch Details</button>
+        <button class="nav-item" onclick="switchTab(this,'jobs')"><span class="nav-icon">⚙</span> Jobs</button>
+        <div class="nav-section">Data</div>
+        <button class="nav-item" onclick="switchTab(this,'products')"><span class="nav-icon">📦</span> Products</button>
+        <button class="nav-item" onclick="switchTab(this,'stats')"><span class="nav-icon">📊</span> Analytics</button>
+        <button class="nav-item" onclick="switchTab(this,'search')"><span class="nav-icon">🔍</span> Search</button>
+        <button class="nav-item" onclick="switchTab(this,'categories')"><span class="nav-icon">🏷</span> Categories</button>
+        <div class="nav-section">System</div>
+        <button class="nav-item" onclick="switchTab(this,'sessions')"><span class="nav-icon">🔑</span> Sessions</button>
+        <button class="nav-item" onclick="switchTab(this,'settings')"><span class="nav-icon">🔄</span> Migrate</button>
+    </nav>
+    <div class="sidebar-footer">
+        <div class="status-pill"><div class="status-dot"></div> System Online</div>
+    </div>
+</aside>
+
+<div class="content">
+    <div class="topbar">
+        <div>
+            <div class="topbar-title" id="topbar-title">New Scrape Job</div>
+            <div class="topbar-sub"   id="topbar-sub">Configure and launch a new data collection task</div>
+        </div>
+        <div id="topbar-actions"></div>
+    </div>
+    <div class="main-scroll"><div id="view-root"></div></div>
+</div>
+
+<div id="modal-root"></div>
+
+<script>
+// ═══════════════════════════════════════════════════════════════════════════
+// CONFIG
+// ═══════════════════════════════════════════════════════════════════════════
+const API = window.location.origin + '/api';
+// API key for authenticated requests — set via Settings tab or localStorage
+const getApiKey = () => localStorage.getItem('scraper_api_key') || '';
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PRODUCT REGISTRY
+// ─────────────────────────────────────────────────────────────────────────
+// All products are stored here by itemId.
+// onclick handlers only embed the itemId string (safe in HTML attributes).
+// openProduct(itemId) looks up the full object — no JSON-in-HTML needed.
+// ═══════════════════════════════════════════════════════════════════════════
+const REGISTRY = new Map();
+
+function registerProducts(list) {
+    (list || []).forEach(p => { if (p.itemId) REGISTRY.set(p.itemId, p); });
+}
+
+function openProduct(itemId) {
+    const p = REGISTRY.get(itemId);
+    if (!p) { console.warn('Product not found in registry:', itemId); return; }
+    S.selected = p;
+    renderModal();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// STATE
+// ═══════════════════════════════════════════════════════════════════════════
+const S = {
+    tab: 'scrape',
+    jobs: [], products: [],
+    pagination: { page:1, total:0, pages:0 },
+    stats: null, loading: false,
+    scrape: {
+        platform:'taobao', keyword:'', maxProducts:100, maxPages:10,
+        startPage:1, language:'en', includeDetails:false, manualCaptcha:false,
+        mode:'keyword',          // 'keyword' | 'category'
+        categoryId:'',           // selected sub-category sub_id
+        categoryName:'',         // Chinese display name
+        selectedGroup:'',        // selected group_id
+        groupCategoryId:'',      // group_id for submission
+        groupCategoryName:'',    // group Chinese name
+        groupCategoryNameEn:'',  // group English name
+    },
+    filters: { platform:'', keyword:'', shopName:'', detailsScraped:'', minQuality:'', page:1, limit:20 },
+    selected: null,
+    migrationLog: [], migrationRunning: false,
+    search: { query:'', page:0, size:20 },
+    searchResults: null, searchLoading: false,
+    sessionStatus: null, sessionLoading: false, proxyStatus: null,
+    qrLogin: { active:false, platform:null, qrImage:null, status:null, polling:false },
+    pendingJobRetry: null,   // fn to call after QR login succeeds
+    cookieImport: { platform:'taobao', text:'' },
+    batch: { mode:'pending', platform:'', limit:'', keyword:'', categoryName:'', minQuality:'', language:'en', delayMin:5000, delayMax:12000 },
+    batchLoading: false,
+    enrichment: { items:[], loading:false, status:'', platform:'', limit:30 },
+    captchaJobId: null,
+    // Category tree loaded from API: { taobao:[{groupId,nameZh,nameEn,subCategories:[...]}], ... }
+    categoryTree: { taobao:[], tmall:[], '1688':[], alibaba:[] },
+    categoriesView: { platform:'taobao', openGroup:null, seeding:false },
+};
+
+const TAB_META = {
+    scrape:     { title:'New Scrape Job',    sub:'Configure and launch a new data collection task' },
+    jobs:       { title:'Job Queue',         sub:'Monitor active and completed scrape jobs' },
+    products:   { title:'Product Catalog',   sub:'Browse and manage scraped product data' },
+    stats:      { title:'Analytics',         sub:'Overview of collected data metrics' },
+    search:     { title:'Search',            sub:'Full-text search across products' },
+    batch:      { title:'Batch Details',     sub:'Scrape product details in bulk' },
+    categories: { title:'Categories',        sub:'Browse Taobao/Tmall category hierarchy' },
+    sessions:   { title:'Session Manager',   sub:'Monitor login sessions and cookie health' },
+    settings:   { title:'Migrations',        sub:'Database schema and data migration tools' },
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HELPERS
+// ═══════════════════════════════════════════════════════════════════════════
+function esc(s) {
+    return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function fmtDate(d) {
+    if (!d) return '—';
+    return new Date(d).toLocaleString('en-US',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
+}
+function qualityColor(q) {
+    return q >= 80 ? 'var(--green-l)' : q >= 50 ? 'var(--amber)' : 'var(--red-l)';
+}
+function platformBadge(p) { return `<span class="badge badge-${esc(p||'')}">${esc(p||'?')}</span>`; }
+function statusBadge(s)   { return `<span class="badge badge-${esc(s||'pending')}">${esc(s||'pending')}</span>`; }
+
+async function apiFetch(path, opts = {}) {
+    const key = getApiKey();
+    if (key) {
+        opts.headers = { ...(opts.headers || {}), 'X-API-Key': key };
+    }
+    try {
+        const r = await fetch(`${API}${path}`, opts);
+        const data = await r.json();
+        // Attach HTTP status so callers can distinguish 409 / 4xx from success
+        data._status = r.status;
+        return data;
+    }
+    catch(e) { return { success:false, error:e.message, _status:0 }; }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TAB SWITCHING
+// ═══════════════════════════════════════════════════════════════════════════
+function switchTab(el, tab) {
+    document.querySelectorAll('.nav-item').forEach(b => b.classList.remove('active'));
+    el.classList.add('active');
+    S.tab = tab;
+    const m = TAB_META[tab] || {};
+    document.getElementById('topbar-title').textContent = m.title || tab;
+    document.getElementById('topbar-sub').textContent   = m.sub   || '';
+    document.getElementById('topbar-actions').innerHTML = '';
+    if (tab === 'jobs')       { fetchJobs(); fetchEnrichmentQueue(); }
+    if (tab === 'products')   fetchProducts();
+    if (tab === 'stats')      fetchStats();
+    if (tab === 'sessions')   fetchSessionStatus();
+    if (tab === 'categories') {
+        const p = S.categoriesView.platform;
+        if (!S.categoryTree[p] || !S.categoryTree[p].length) fetchCategoryTree(p);
+    }
+    renderView();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DATA FETCHERS
+// ═══════════════════════════════════════════════════════════════════════════
+async function fetchJobs() {
+    const d = await apiFetch('/scraper/jobs');
+    if (d.success) {
+        S.jobs = d.data || [];
+        syncCaptchaModal();
+        if (S.tab === 'jobs') renderView();
+    }
+}
+
+async function fetchEnrichmentQueue() {
+    S.enrichment.loading = true;
+    if (S.tab === 'jobs') renderView();
+    const p = new URLSearchParams();
+    if (S.enrichment.status) p.append('status', S.enrichment.status);
+    if (S.enrichment.platform) p.append('platform', S.enrichment.platform);
+    if (S.enrichment.limit) p.append('limit', S.enrichment.limit);
+    const d = await apiFetch('/scraper/enrichment-queue?' + p.toString());
+    if (d.success) {
+        S.enrichment.items = d.data || [];
+    }
+    S.enrichment.loading = false;
+    if (S.tab === 'jobs') renderView();
+}
+
+async function requeueEnrichment(status = 'retry', itemIds = null) {
+    const payload = itemIds ? { itemIds } : {
+        status,
+        platform: S.enrichment.platform || null,
+        limit: S.enrichment.limit || null,
+    };
+    const d = await apiFetch('/scraper/enrichment-queue/requeue', {
+        method: 'POST',
+        headers: { 'Content-Type':'application/json' },
+        body: JSON.stringify(payload),
+    });
+    if (!d.success) {
+        alert(d.detail || d.error || 'Failed to requeue enrichment items');
+        return;
+    }
+    await fetchEnrichmentQueue();
+}
+
+function syncCaptchaModal() {
+    const waiting = S.jobs.find(j => j.status === 'captcha_required' && j.captcha?.required);
+    if (waiting) {
+        S.captchaJobId = waiting.jobId;
+        renderModal();
+        return;
+    }
+    if (S.captchaJobId) {
+        S.captchaJobId = null;
+        renderModal();
+    }
+}
+
+async function fetchProducts() {
+    S.loading = true; renderView();
+    const p = new URLSearchParams();
+    Object.entries(S.filters).forEach(([k,v]) => { if (v !== '' && v !== null) p.append(k, v); });
+    try {
+        const d = await apiFetch(`/products?${p}`);
+        if (d.success) {
+            S.products = d.data.products || [];
+            S.pagination = d.data.pagination || { page:1, total:0, pages:0 };
+            registerProducts(S.products);   // ← register for safe lookup
+        }
+    } catch(e) {}
+    S.loading = false; renderView();
+}
+
+function exportProducts(format) {
+    const p = new URLSearchParams();
+    if (S.filters.platform)       p.append('platform', S.filters.platform);
+    if (S.filters.keyword)        p.append('keyword', S.filters.keyword);
+    if (S.filters.detailsScraped) p.append('detailsScraped', S.filters.detailsScraped);
+    if (S.filters.minQuality)     p.append('minQuality', S.filters.minQuality);
+    window.open(`/api/products/export/${format}?${p}`, '_blank');
+}
+
+async function fetchStats() {
+    S.loading = true; renderView();
+    try { const d = await apiFetch('/products/stats/summary'); if (d.success) S.stats = d.data; }
+    catch(e) {}
+    S.loading = false; renderView();
+}
+
+async function startScraping() {
+    if (!S.scrape.keyword || S.loading) return;
+    S.loading = true; renderView();
+    try {
+        const d = await apiFetch('/scraper/search', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                platform:       S.scrape.platform,
+                keyword:        S.scrape.keyword,
+                maxProducts:    S.scrape.maxProducts,
+                maxPages:       S.scrape.maxPages,
+                startPage:      S.scrape.startPage,
+                language:       S.scrape.language,
+                includeDetails: S.scrape.includeDetails,
+                manualCaptcha:  S.scrape.manualCaptcha,
+            })
+        });
+        if (d.success) {
+            const btn = document.querySelector('[onclick*="jobs"]');
+            if (btn) switchTab(btn, 'jobs');
+            await fetchJobs();
+        } else if (d._status === 409 && (d.detail || d.error || '').includes('QR login')) {
+            // Server requires a fresh login — open QR modal and retry after success
+            S.pendingJobRetry = () => startScraping();
+            startQrLogin(S.scrape.platform);
+        } else {
+            alert(d.detail || d.error || 'Failed to start job');
+        }
+    } catch(e) { alert(e.message); }
+    S.loading = false; renderView();
+}
+
+async function cancelJob(jobId) {
+    await apiFetch(`/scraper/job/${jobId}`, { method:'DELETE' });
+    fetchJobs();
+}
+
+async function resumeCaptchaJob(jobId) {
+    const d = await apiFetch(`/scraper/job/${jobId}/resume-captcha`, { method:'POST' });
+    if (!d.success) {
+        alert(d.message || d.error || 'CAPTCHA is still visible. Solve it in the browser window, then click Continue.');
+    }
+    await fetchJobs();
+}
+
+async function scrapeDetails(itemId) {
+    const d = await apiFetch(`/scraper/details/${itemId}`, { method:'POST' });
+    if (d.success) fetchProducts();
+    else alert(d.error || 'Failed to scrape details');
+}
+
+async function startBatchDetails() {
+    if (S.batchLoading) return;
+    S.batchLoading = true; renderView();
+    try {
+        const payload = {
+            mode:     S.batch.mode,
+            language: S.batch.language,
+            delayMin: parseInt(S.batch.delayMin) || 5000,
+            delayMax: parseInt(S.batch.delayMax) || 12000,
+        };
+        if (S.batch.platform)     payload.platform     = S.batch.platform;
+        if (S.batch.limit)        payload.limit         = parseInt(S.batch.limit);
+        if (S.batch.keyword)      payload.keyword       = S.batch.keyword;
+        if (S.batch.categoryName) payload.categoryName  = S.batch.categoryName;
+        if (S.batch.minQuality)   payload.minQuality    = parseInt(S.batch.minQuality);
+
+        const d = await apiFetch('/scraper/scrape-pending-details', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        if (d.success) {
+            const btn = document.querySelector('[onclick*="jobs"]');
+            if (btn) switchTab(btn, 'jobs');
+            await fetchJobs();
+        } else if (d._status === 409 && S.batch.platform && (d.detail || d.error || '').includes('QR login')) {
+            S.pendingJobRetry = () => startBatchDetails();
+            startQrLogin(S.batch.platform);
+        } else { alert(d.detail || d.error || d.message || 'Failed to start batch job'); }
+    } catch(e) { alert(e.message); }
+    S.batchLoading = false; renderView();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SEARCH
+// ═══════════════════════════════════════════════════════════════════════════
+let searchDebounce = null;
+
+function onSearchInput(val) {
+    S.search.query = val;
+    clearTimeout(searchDebounce);
+    searchDebounce = setTimeout(() => { if (val.trim().length >= 2) executeSearch(0); }, 500);
+}
+
+async function executeSearch(page = 0) {
+    const inp = document.getElementById('search-input');
+    const query = inp ? inp.value.trim() : S.search.query.trim();
+    if (!query) return;
+    S.search.query = query; S.search.page = page;
+    S.searchLoading = true; patchSearchResults();
+    try {
+        const params = new URLSearchParams({ q:query, page:page+1, limit:S.search.size });
+        const d = await apiFetch(`/products/search/text?${params}`);
+        if (d.success) {
+            const products = d.data.products || [];
+            registerProducts(products);   // ← register search results too
+            S.searchResults = {
+                items:    products.map(p => ({ itemId:p.itemId, title:p.title, subtitle:`¥${p.price||'?'} · ${p.platform}`, platform:p.platform })),
+                total:    d.data.count || 0,
+                query,
+                hasMore:  products.length >= S.search.size
+            };
+        } else { S.searchResults = null; }
+    } catch(e) { S.searchResults = null; }
+    S.searchLoading = false; patchSearchResults();
+}
+
+function patchSearchResults() {
+    const el = document.getElementById('search-results');
+    if (el) el.innerHTML = buildSearchResultsHTML();
+}
+
+function buildSearchResultsHTML() {
+    if (S.searchLoading) return `<div class="card"><div class="empty"><div class="empty-icon">⏳</div><div class="empty-text">Searching…</div></div></div>`;
+    const sr = S.searchResults;
+    if (!sr) return `<div class="card"><div class="empty"><div class="empty-icon">🔍</div><div class="empty-text">Enter a query to search</div></div></div>`;
+    if (!sr.items.length) return `<div class="card"><div class="empty"><div class="empty-icon">🤷</div><div class="empty-text">No results for "${esc(sr.query)}"</div></div></div>`;
+
+    return `
+    <div class="search-result-list fade-in">
+      ${sr.items.map(r => `
+      <div class="search-result-item" onclick="openProduct('${esc(r.itemId)}')">
+        <div class="result-icon">📦</div>
+        <div>
+          <div style="font-size:13px;font-weight:500;color:var(--text);line-height:1.4">${esc(r.title)}</div>
+          <div style="font-size:12px;color:var(--muted);margin-top:2px;font-family:var(--mono)">${esc(r.subtitle)}</div>
+        </div>
+        <div>${platformBadge(r.platform)}</div>
+      </div>`).join('')}
+    </div>
+    ${sr.hasMore ? `
+    <div class="pagination">
+      <button class="btn btn-ghost btn-sm" onclick="executeSearch(${S.search.page-1})" ${S.search.page<=0?'disabled':''}>← Prev</button>
+      <span class="page-info">Page ${S.search.page+1}</span>
+      <button class="btn btn-ghost btn-sm" onclick="executeSearch(${S.search.page+1})">Next →</button>
+    </div>` : ''}`;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MIGRATIONS
+// ═══════════════════════════════════════════════════════════════════════════
+async function runMigrations() {
+    const d = await apiFetch('/migration/run', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({}) });
+    if (d.success) appendLog('✓ MongoDB migrations completed','success');
+    else appendLog('✗ Migration error: ' + (d.data?.errors?.[0]?.error || d.error),'error');
+}
+
+function runPgMigration(force = false) {
+    if (S.migrationRunning) return;
+    S.migrationRunning = true; S.migrationLog = []; renderView();
+    fetch(`${API}/pg-migration/run`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({force}) })
+        .then(async res => {
+            const reader = res.body.getReader(), decoder = new TextDecoder();
+            let buf = '';
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buf += decoder.decode(value, { stream:true });
+                const lines = buf.split('\n'); buf = lines.pop();
+                for (const line of lines) {
+                    if (line.startsWith('data: ')) {
+                        try { handlePgEvent(JSON.parse(line.slice(6))); } catch(e) {}
+                    }
+                }
+            }
+            S.migrationRunning = false; renderView();
+        }).catch(err => { appendLog('Connection error: ' + err.message, 'error'); S.migrationRunning = false; renderView(); });
+}
+
+function handlePgEvent(evt) {
+    const map = {
+        start:'▶ Migration started', phase:'— '+evt.message,
+        phase_done:'✓ Phase complete: '+evt.phase,
+        progress: evt.message, complete:'✓ Migration complete!', error:'✗ '+(evt.error||'')
+    };
+    const types = { start:'info', phase:'warn', phase_done:'success', progress:'info', complete:'success', error:'error' };
+    if (map[evt.type]) appendLog(map[evt.type], types[evt.type] || 'info');
+}
+
+function appendLog(msg, type = 'info') {
+    S.migrationLog.push({ msg, type });
+    const el = document.getElementById('migration-log');
+    if (el) { el.innerHTML += `<div class="log-${type}">${esc(msg)}</div>`; el.scrollTop = el.scrollHeight; }
+}
+
+async function verifyMigration() {
+    const d = await apiFetch('/pg-migration/verify');
+    const el = document.getElementById('verify-output');
+    if (!el) return;
+    if (!d.success) { el.innerHTML = `<p style="color:var(--red-l);margin-top:12px;font-size:13px">Error: ${esc(d.error||'Failed')}</p>`; return; }
+    const v = d.data;
+    el.innerHTML = `<div style="margin-top:16px">
+      <div class="detail-row"><span class="detail-key">Mongo Products</span><span class="detail-val">${(v.mongo?.products||0).toLocaleString()}</span></div>
+      <div class="detail-row"><span class="detail-key">PG Products</span><span class="detail-val">${(v.postgres?.products||0).toLocaleString()}</span></div>
+      <div class="detail-row"><span class="detail-key">PG Shops</span><span class="detail-val">${(v.postgres?.shops||0).toLocaleString()}</span></div>
+      <div class="detail-row"><span class="detail-key">PG Images</span><span class="detail-val">${(v.postgres?.product_images||0).toLocaleString()}</span></div>
+      <div class="detail-row"><span class="detail-key">PG Specs</span><span class="detail-val">${(v.postgres?.product_specs||0).toLocaleString()}</span></div>
+      <div class="detail-row"><span class="detail-key">Migrated OK</span><span class="detail-val" style="color:var(--green-l)">${(v.migration_log?.success||0).toLocaleString()}</span></div>
+      <div class="detail-row"><span class="detail-key">Failed</span><span class="detail-val" style="color:var(--red-l)">${(v.migration_log?.failed||0).toLocaleString()}</span></div>
+    </div>`;
+}
+
+async function fetchSessionStatus() {
+    S.sessionLoading = true; renderView();
+    try {
+        const [sess, prx] = await Promise.all([
+            apiFetch('/scraper/session-status'),
+            apiFetch('/scraper/proxy-status'),
+        ]);
+        if (sess.success) S.sessionStatus = sess.data;
+        if (prx.success)  S.proxyStatus   = prx.data;
+    } catch(e) {}
+    S.sessionLoading = false; renderView();
+}
+
+// ── Cookie Import ────────────────────────────────────────────────────
+async function importCookies() {
+    const plat = S.cookieImport.platform;
+    const text = S.cookieImport.text.trim();
+    if (!text) return alert('Please paste cookies JSON first');
+    let cookies;
+    try { cookies = JSON.parse(text); } catch(e) { return alert('Invalid JSON: ' + e.message); }
+    if (!Array.isArray(cookies)) return alert('Cookies must be a JSON array');
+    try {
+        const res = await apiFetch('/scraper/import-cookies', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({ platform: plat, cookies })
+        });
+        if (res.success) {
+            S.cookieImport.text = '';
+            alert(res.message || 'Cookies imported!');
+            fetchSessionStatus();
+        } else { alert(res.error || 'Import failed'); }
+    } catch(e) { alert('Error: ' + e.message); }
+}
+
+async function clearCookies(platform) {
+    if (!confirm(`Clear all cookies for ${platform}?`)) return;
+    try {
+        const res = await apiFetch(`/scraper/clear-cookies/${platform}`, { method:'DELETE' });
+        if (res.success) fetchSessionStatus();
+        else alert(res.error || 'Failed');
+    } catch(e) { alert('Error: ' + e.message); }
+}
+
+async function exportCookies(platform) {
+    try {
+        const res = await apiFetch(`/scraper/export-cookies/${platform}`);
+        if (res.success && res.data?.cookies) {
+            const blob = new Blob([JSON.stringify(res.data.cookies, null, 2)], {type:'application/json'});
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = platform === '1688' ? 'cookies-1688.json' : 'cookies.json';
+            a.click();
+        } else { alert(res.error || 'No cookies found'); }
+    } catch(e) { alert('Error: ' + e.message); }
+}
+
+// ── QR Login (Modal) ─────────────────────────────────────────────────
+function openQrModal(title, bodyHtml) {
+    const root = document.getElementById('modal-root');
+    root.innerHTML = `
+    <div class="modal-overlay" id="qr-modal-overlay">
+        <div class="modal" style="max-width:420px">
+            <div class="modal-header">
+                <div class="modal-title">${title}</div>
+                <button class="modal-close" onclick="cancelQrLogin()">\u00d7</button>
+            </div>
+            <div class="modal-body" id="qr-modal-body">${bodyHtml}</div>
+        </div>
+    </div>`;
+    document.getElementById('qr-modal-overlay').addEventListener('click', e => {
+        if (e.target.id === 'qr-modal-overlay') cancelQrLogin();
+    });
+}
+
+function updateQrModalBody(html) {
+    const body = document.getElementById('qr-modal-body');
+    if (body) body.innerHTML = html;
+}
+
+function closeQrModal() {
+    document.getElementById('modal-root').innerHTML = '';
+}
+
+function renderQrModalBody() {
+    const qr = S.qrLogin;
+    if (qr.status === 'loading') {
+        return `<div class="qr-status qr-status-loading qr-pulse">Starting browser...</div>`;
+    }
+    let html = '';
+    if (qr.qrImage) {
+        html += `<div class="qr-container"><img src="${qr.qrImage}" /></div>`;
+    }
+    if (qr.status === 'waiting') {
+        html += `<div class="qr-status qr-status-waiting qr-pulse">Scan the QR code with your mobile app</div>`;
+    } else if (qr.status === 'success') {
+        html += `<div class="qr-status qr-status-success">${esc(qr.message || 'Login successful!')}</div>`;
+    } else if (qr.status === 'expired') {
+        html += `<div class="qr-status qr-status-expired">${esc(qr.message || 'QR code expired')}</div>`;
+        html += `<div style="text-align:center;margin-top:12px"><button class="btn btn-primary btn-sm" onclick="startQrLogin('${esc(qr.platform)}')">Retry</button></div>`;
+    } else if (qr.status === 'error') {
+        html += `<div class="qr-status qr-status-error">${esc(qr.error || 'Error')}</div>`;
+    }
+    return html;
+}
+
+async function startQrLogin(platform) {
+    S.qrLogin = { active:true, platform, qrImage:null, status:'loading', polling:false };
+    openQrModal(`QR Code Login \u2014 ${platform}`, renderQrModalBody());
+    try {
+        const res = await apiFetch(`/scraper/qr-login/${platform}`, { method:'POST' });
+        if (res.success && res.data) {
+            S.qrLogin.qrImage = res.data.qrImage;
+            S.qrLogin.status = 'waiting';
+            S.qrLogin.polling = true;
+            updateQrModalBody(renderQrModalBody());
+            pollQrStatus(platform);
+        } else {
+            S.qrLogin.status = 'error';
+            S.qrLogin.error = res.error || 'Failed to start QR login';
+            updateQrModalBody(renderQrModalBody());
+        }
+    } catch(e) {
+        S.qrLogin.status = 'error'; S.qrLogin.error = e.message;
+        updateQrModalBody(renderQrModalBody());
+    }
+}
+
+async function pollQrStatus(platform) {
+    if (!S.qrLogin.polling) return;
+    try {
+        const res = await apiFetch(`/scraper/qr-login/${platform}/status`);
+        if (!S.qrLogin.polling) return;
+        if (res.success && res.data) {
+            S.qrLogin.status = res.data.status;
+            if (res.data.qrImage) S.qrLogin.qrImage = res.data.qrImage;
+            if (res.data.status === 'success') {
+                S.qrLogin.polling = false;
+                S.qrLogin.message = res.data.message;
+                updateQrModalBody(renderQrModalBody());
+                setTimeout(() => {
+                    closeQrModal();
+                    S.qrLogin = { active:false, platform:null, qrImage:null, status:null, polling:false };
+                    fetchSessionStatus();
+                    // If login was triggered by a blocked job, retry it now
+                    if (S.pendingJobRetry) {
+                        const retry = S.pendingJobRetry;
+                        S.pendingJobRetry = null;
+                        retry();
+                    }
+                }, 2000);
+                return;
+            }
+            if (res.data.status === 'expired') {
+                S.qrLogin.polling = false;
+                S.qrLogin.message = 'QR code expired. Click Retry to try again.';
+                updateQrModalBody(renderQrModalBody());
+                return;
+            }
+        }
+        updateQrModalBody(renderQrModalBody());
+        setTimeout(() => pollQrStatus(platform), 3000);
+    } catch(e) {
+        S.qrLogin.polling = false; S.qrLogin.status = 'error'; S.qrLogin.error = e.message;
+        updateQrModalBody(renderQrModalBody());
+    }
+}
+
+async function cancelQrLogin() {
+    const wasPlatform = S.qrLogin.platform;
+    S.qrLogin.polling = false;
+    S.qrLogin = { active:false, platform:null, qrImage:null, status:null, polling:false };
+    S.pendingJobRetry = null;
+    closeQrModal();
+    if (wasPlatform) {
+        try { await apiFetch(`/scraper/qr-login/${wasPlatform}/cancel`, { method:'POST' }); } catch(e) {}
+    }
+}
+
+// ── Proxy Management ─────────────────────────────────────────────────
+async function setGateway() {
+    const input = document.getElementById('gateway-input');
+    const sticky = document.getElementById('gateway-sticky');
+    if (!input || !input.value.trim()) return alert('Enter a gateway proxy URL');
+    try {
+        const res = await apiFetch('/scraper/proxy/gateway', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({ url: input.value.trim(), sticky: sticky?.checked || false })
+        });
+        if (res.success) { input.value = ''; if(sticky) sticky.checked = false; fetchSessionStatus(); }
+        else alert(res.error || 'Failed to set gateway');
+    } catch(e) { alert('Error: ' + e.message); }
+}
+
+async function addProxy() {
+    const input = document.getElementById('proxy-input');
+    if (!input || !input.value.trim()) return alert('Enter a proxy URL');
+    try {
+        const res = await apiFetch('/scraper/proxy', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({ proxy: input.value.trim() })
+        });
+        if (res.success) { input.value = ''; fetchSessionStatus(); }
+        else alert(res.error || 'Failed to add proxy');
+    } catch(e) { alert('Error: ' + e.message); }
+}
+
+async function removeProxy(hostPort) {
+    if (!confirm(`Remove proxy ${hostPort}?`)) return;
+    try {
+        const res = await apiFetch(`/scraper/proxy/${encodeURIComponent(hostPort)}`, { method:'DELETE' });
+        if (res.success) fetchSessionStatus();
+        else alert(res.error || 'Failed');
+    } catch(e) { alert('Error: ' + e.message); }
+}
+
+async function setProxyProvider() {
+    const url = document.getElementById('provider-url-input');
+    const protocol = document.getElementById('provider-protocol-input');
+    const username = document.getElementById('provider-username-input');
+    const password = document.getElementById('provider-password-input');
+    const replace = document.getElementById('provider-replace-input');
+    const refreshInterval = document.getElementById('provider-refresh-interval-input');
+    const minAvailable = document.getElementById('provider-min-available-input');
+    if (!url || !url.value.trim()) return alert('Enter a proxy provider API URL');
+    try {
+        const res = await apiFetch('/scraper/proxy/provider', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({
+                url: url.value.trim(),
+                protocol: protocol?.value || 'http',
+                username: username?.value || '',
+                password: password?.value || '',
+                replaceExisting: replace?.checked !== false,
+                refreshIntervalSec: parseInt(refreshInterval?.value || '300', 10) || 300,
+                minAvailable: parseInt(minAvailable?.value || '2', 10) || 2,
+            })
+        });
+        if (res.success) fetchSessionStatus();
+        else alert(res.message || res.error || 'Failed to configure proxy provider');
+    } catch(e) { alert('Error: ' + e.message); }
+}
+
+async function refreshProxyProvider() {
+    const replace = document.getElementById('provider-replace-input');
+    try {
+        const res = await apiFetch(`/scraper/proxy/provider/refresh?replace_existing=${replace?.checked !== false}`, {
+            method:'POST'
+        });
+        if (res.success) fetchSessionStatus();
+        else alert(res.message || res.error || 'Failed to refresh provider proxies');
+    } catch(e) { alert('Error: ' + e.message); }
+}
+
+async function clearProxyProvider() {
+    if (!confirm('Remove the proxy provider configuration and all fetched provider proxies?')) return;
+    try {
+        const res = await apiFetch('/scraper/proxy/provider', { method:'DELETE' });
+        if (res.success) fetchSessionStatus();
+        else alert(res.error || 'Failed');
+    } catch(e) { alert('Error: ' + e.message); }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VIEW RENDERERS
+// ═══════════════════════════════════════════════════════════════════════════
+function renderScrapeView() {
+    const sc = S.scrape;
+    const tree = S.categoryTree[sc.platform] || [];
+    const groups = tree;
+    const selectedGroupObj = groups.find(g => g.groupId === sc.selectedGroup) || null;
+    const subs = selectedGroupObj ? (selectedGroupObj.subCategories || []) : [];
+
+    const langOptions = ['en','zh','th','ja','ko','ru'];
+    const langLabels  = {en:'English',zh:'Chinese',th:'Thai',ja:'Japanese',ko:'Korean',ru:'Russian'};
+
+    const modeKeyword  = sc.mode === 'keyword';
+    const modeCategory = sc.mode === 'category';
+
+    const groupOptions = groups.length
+        ? groups.map(g => `<option value="${esc(g.groupId)}"${sc.selectedGroup===g.groupId?' selected':''}>${esc(g.nameZh)} — ${esc(g.nameEn)}</option>`).join('')
+        : `<option value="">Loading categories…</option>`;
+
+    return `<div class="fade-in" style="max-width:580px">
+  <div class="card">
+    <div class="card-title">Platform</div>
+    <div class="seg-group" style="width:100%;margin-bottom:20px">
+      ${['taobao','tmall','1688','alibaba'].map(p => `
+      <button class="seg-btn${sc.platform===p?' active':''}" style="flex:1"
+        onclick="setScrapeField('platform','${p}')">${p}</button>`).join('')}
+    </div>
+
+    ${sc.platform === 'alibaba' ? `
+    <div style="padding:10px 14px;background:rgba(34,197,94,0.06);border:1px solid rgba(34,197,94,0.2);border-radius:var(--radius);font-size:12px;color:#16a34a;margin-bottom:16px;font-family:var(--mono)">
+      ✓ Alibaba.com — no login required, scrapes in guest mode
+    </div>` : ''}
+
+    <div class="card-title" style="margin-top:0">Mode</div>
+    <div class="seg-group" style="width:100%;margin-bottom:20px">
+      <button class="seg-btn${modeKeyword?' active':''}" style="flex:1"
+        onclick="setScrapeField('mode','keyword')">Keyword Search</button>
+      <button class="seg-btn${modeCategory?' active':''}" style="flex:1"
+        onclick="setScrapeField('mode','category')">Category Scrape</button>
+    </div>
+
+    ${modeKeyword ? `
+    <div class="form-group">
+      <label>Keyword</label>
+      <input type="text" value="${esc(sc.keyword)}"
+        oninput="S.scrape.keyword=this.value"
+        onkeydown="if(event.key==='Enter') startScraping()"
+        placeholder="e.g. 电脑, wireless earbuds, baby formula" />
+    </div>` : `
+    <div class="card-title" style="margin-top:0">Group Category</div>
+    <div class="form-group" style="margin-bottom:10px">
+      <select onchange="selectScrapeGroup(this.value)"
+        style="width:100%;padding:8px 10px;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);color:var(--text);font-size:13px">
+        <option value="">— Select a group —</option>
+        ${groupOptions}
+      </select>
+    </div>
+    ${selectedGroupObj ? `
+    <div class="card-title" style="margin-top:0">Sub-Category <span style="font-size:10px;color:var(--muted);font-weight:400">${esc(selectedGroupObj.nameZh)}</span></div>
+    <div class="chip-wrap" style="margin-bottom:16px">
+      ${subs.map(sub => `<button class="chip${sc.categoryId===sub.subId?' active':''}"
+        onclick="selectScrapeSubCat('${esc(sub.subId)}','${esc(sub.nameZh)}','${esc(sub.nameEn || '')}','${esc(selectedGroupObj.groupId)}','${esc(selectedGroupObj.nameZh)}','${esc(selectedGroupObj.nameEn)}')"
+        title="${esc(sub.nameEn)}">${esc(sub.nameZh)}</button>`).join('')}
+    </div>` : ''}
+    <div class="form-group" style="margin-bottom:8px">
+      <label>Category ID <span style="font-size:10px;font-weight:400;color:var(--muted)">(auto-filled or enter manually)</span></label>
+      <input type="text" value="${esc(sc.categoryId)}"
+        oninput="S.scrape.categoryId=this.value"
+        onkeydown="if(event.key==='Enter') startCategoryScrape()"
+        placeholder="e.g. womens_dresses or 50014866" />
+    </div>
+    ${sc.groupCategoryId ? `
+    <div style="font-size:11px;color:var(--muted);margin-bottom:12px;font-family:var(--mono)">
+      Group: ${esc(sc.groupCategoryName)} / ${esc(sc.groupCategoryNameEn)}
+    </div>` : ''}`}
+
+    <div class="grid-2" style="margin-bottom:16px">
+      <div class="form-group">
+        <label>Max Products</label>
+        <input type="number" value="${sc.maxProducts}" min="1" max="1000"
+          oninput="S.scrape.maxProducts=Math.max(1,parseInt(this.value)||100)" />
+      </div>
+      <div class="form-group">
+        <label>Max Pages</label>
+        <input type="number" value="${sc.maxPages}" min="1" max="100"
+          oninput="S.scrape.maxPages=Math.max(1,parseInt(this.value)||10)" />
+      </div>
+    </div>
+
+    ${modeKeyword ? `
+    <div class="grid-2" style="margin-bottom:16px">
+      <div class="form-group">
+        <label>Start Page</label>
+        <input type="number" value="${sc.startPage}" min="1" max="100"
+          oninput="S.scrape.startPage=Math.max(1,parseInt(this.value)||1)" />
+      </div>
+      <div class="form-group">
+        <label>Language</label>
+        <select onchange="S.scrape.language=this.value" style="width:100%;padding:8px 10px;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);color:var(--text);font-size:13px">
+          ${langOptions.map(l => `<option value="${l}"${sc.language===l?' selected':''}>${langLabels[l]}</option>`).join('')}
+        </select>
+      </div>
+    </div>` : `
+    <div class="form-group" style="margin-bottom:16px">
+      <label>Language</label>
+      <select onchange="S.scrape.language=this.value" style="width:100%;padding:8px 10px;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);color:var(--text);font-size:13px">
+        ${langOptions.map(l => `<option value="${l}"${sc.language===l?' selected':''}>${langLabels[l]}</option>`).join('')}
+      </select>
+    </div>`}
+
+    <div class="form-group" style="margin-bottom:20px">
+      <label style="display:flex;align-items:center;gap:8px;text-transform:none;cursor:pointer;font-weight:400">
+        <input type="checkbox" ${sc.includeDetails?'checked':''} onchange="S.scrape.includeDetails=this.checked"
+          style="width:auto;accent-color:var(--amber)" />
+        <span style="font-size:13px;color:var(--text2)">Scrape product details <span style="color:var(--muted)">(slower)</span></span>
+      </label>
+    </div>
+
+    <div class="form-group" style="margin-bottom:20px">
+      <label style="display:flex;align-items:flex-start;gap:8px;text-transform:none;cursor:pointer;font-weight:400">
+        <input type="checkbox" ${sc.manualCaptcha?'checked':''} onchange="S.scrape.manualCaptcha=this.checked"
+          style="width:auto;accent-color:var(--amber);margin-top:2px" />
+        <span style="font-size:13px;color:var(--text2)">Manual CAPTCHA assist
+          <span style="display:block;color:var(--muted);font-size:11px;margin-top:3px">
+            Launches a visible browser window, pauses the job on CAPTCHA, and lets you continue after solving it manually.
+          </span>
+        </span>
+      </label>
+    </div>
+
+    ${modeKeyword && !sc.keyword ? `
+    <div style="padding:10px 14px;background:rgba(240,165,0,0.06);border:1px solid rgba(240,165,0,0.2);border-radius:var(--radius);font-size:12px;color:#d97706;margin-bottom:16px;font-family:var(--mono)">
+      ⚠ Enter a keyword above
+    </div>` : ''}
+    ${modeCategory && !sc.categoryId ? `
+    <div style="padding:10px 14px;background:rgba(240,165,0,0.06);border:1px solid rgba(240,165,0,0.2);border-radius:var(--radius);font-size:12px;color:#d97706;margin-bottom:16px;font-family:var(--mono)">
+      ⚠ Select or enter a category above
+    </div>` : ''}
+
+    ${modeKeyword
+        ? `<button class="btn btn-primary btn-full" onclick="startScraping()" ${S.loading||!sc.keyword?'disabled':''}>
+             ${S.loading ? '⏳ Starting…' : '▶ Start Keyword Scrape'}
+           </button>`
+        : `<button class="btn btn-primary btn-full" onclick="startCategoryScrape()" ${S.loading||!sc.categoryId?'disabled':''}>
+             ${S.loading ? '⏳ Starting…' : '▶ Start Category Scrape'}
+           </button>`}
+  </div>
+</div>`;
+}
+
+// ─── Scrape view helpers ──────────────────────────────────────────────────────
+
+function setScrapeField(key, val) {
+    S.scrape[key] = val;
+    // When platform changes, reload the category tree
+    if (key === 'platform') {
+        S.scrape.selectedGroup = '';
+        S.scrape.categoryId    = '';
+        S.scrape.groupCategoryId = '';
+        fetchCategoryTree(val);
+    }
+    renderView();
+}
+
+function selectScrapeGroup(groupId) {
+    S.scrape.selectedGroup = groupId;
+    S.scrape.categoryId    = '';
+    S.scrape.groupCategoryId   = '';
+    S.scrape.groupCategoryName  = '';
+    S.scrape.groupCategoryNameEn = '';
+    renderView();
+}
+
+function selectScrapeSubCat(subId, nameZh, nameEn, groupId, groupZh, groupEn) {
+    S.scrape.categoryId          = subId;
+    S.scrape.categoryName        = nameZh;
+    S.scrape.groupCategoryId     = groupId;
+    S.scrape.groupCategoryName   = groupZh;
+    S.scrape.groupCategoryNameEn = groupEn;
+    renderView();
+}
+
+async function startCategoryScrape() {
+    const sc = S.scrape;
+    if (!sc.categoryId || S.loading) return;
+    S.loading = true; renderView();
+    try {
+        const d = await apiFetch('/scraper/category', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                platform:            sc.platform,
+                categoryId:          sc.categoryId,
+                categoryName:        sc.categoryName || sc.categoryId,
+                groupCategoryId:     sc.groupCategoryId || undefined,
+                groupCategoryName:   sc.groupCategoryName || undefined,
+                groupCategoryNameEn: sc.groupCategoryNameEn || undefined,
+                maxProducts:         sc.maxProducts,
+                maxPages:            sc.maxPages,
+                language:            sc.language,
+                includeDetails:      sc.includeDetails,
+                manualCaptcha:       sc.manualCaptcha,
+            }),
+        });
+        if (d.success) {
+            const btn = document.querySelector('[onclick*="jobs"]');
+            if (btn) switchTab(btn, 'jobs');
+            await fetchJobs();
+        } else if (d._status === 409 && (d.detail || d.error || '').includes('QR login')) {
+            S.pendingJobRetry = () => startCategoryScrape();
+            startQrLogin(S.scrape.platform);
+        } else {
+            alert(d.detail || d.error || 'Failed to start category scrape');
+        }
+    } catch(e) { alert(e.message); }
+    S.loading = false; renderView();
+}
+
+// Load category tree from API for a platform
+async function fetchCategoryTree(platform) {
+    try {
+        const d = await apiFetch('/categories/tree?platform=' + encodeURIComponent(platform));
+        if (d.success && d.data) {
+            S.categoryTree[platform] = d.data;
+            if (S.tab === 'scrape' || S.tab === 'categories') renderView();
+        }
+    } catch(e) { /* silent — categories are optional */ }
+}
+
+function renderJobsView() {
+    const queueItems = S.enrichment.items || [];
+    const queueHeader = `<div style="display:flex;align-items:center;justify-content:space-between;margin:20px 0 14px">
+  <span style="font-family:var(--mono);font-size:12px;color:var(--muted)">${queueItems.length} ENRICHMENT ITEMS</span>
+  <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+    <select onchange="S.enrichment.status=this.value;fetchEnrichmentQueue()" style="background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);padding:6px 8px;color:var(--text);font-size:11px">
+      <option value="" ${S.enrichment.status===''?'selected':''}>All statuses</option>
+      ${['pending','retry','failed','completed'].map(s => `<option value="${s}" ${S.enrichment.status===s?'selected':''}>${s}</option>`).join('')}
+    </select>
+    <select onchange="S.enrichment.platform=this.value;fetchEnrichmentQueue()" style="background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);padding:6px 8px;color:var(--text);font-size:11px">
+      <option value="" ${S.enrichment.platform===''?'selected':''}>All platforms</option>
+      ${['taobao','tmall','1688','alibaba'].map(p => `<option value="${p}" ${S.enrichment.platform===p?'selected':''}>${p}</option>`).join('')}
+    </select>
+    <button class="btn btn-ghost btn-sm" onclick="fetchEnrichmentQueue()">↻ Queue</button>
+    <button class="btn btn-ghost btn-sm" onclick="requeueEnrichment('retry')" ${(S.enrichment.status && S.enrichment.status!=='retry')?'':'style="color:var(--amber)"'}>Requeue Retry</button>
+    <button class="btn btn-ghost btn-sm" onclick="requeueEnrichment('failed')">Requeue Failed</button>
+  </div>
+</div>`;
+    const queueBlock = S.enrichment.loading
+        ? `<div class="card"><div class="empty"><div class="empty-icon">⏳</div><div class="empty-text">Loading enrichment queue…</div></div></div>`
+        : !queueItems.length
+        ? `<div class="card"><div class="empty"><div class="empty-icon">🧪</div><div class="empty-text">No enrichment queue items match the current filters</div></div></div>`
+        : `<div class="card" style="overflow:auto">
+      <table style="width:100%;border-collapse:collapse;font-size:12px">
+        <thead>
+          <tr style="border-bottom:1px solid var(--border)">
+            <th style="text-align:left;padding:8px 10px;font-family:var(--mono);font-size:10px;color:var(--muted)">ITEM</th>
+            <th style="text-align:left;padding:8px 10px;font-family:var(--mono);font-size:10px;color:var(--muted)">STATUS</th>
+            <th style="text-align:left;padding:8px 10px;font-family:var(--mono);font-size:10px;color:var(--muted)">FAILURE</th>
+            <th style="text-align:left;padding:8px 10px;font-family:var(--mono);font-size:10px;color:var(--muted)">NEXT</th>
+            <th style="text-align:center;padding:8px 10px;font-family:var(--mono);font-size:10px;color:var(--muted)">ATTEMPTS</th>
+            <th style="text-align:right;padding:8px 10px;font-family:var(--mono);font-size:10px;color:var(--muted)"></th>
+          </tr>
+        </thead>
+        <tbody>
+          ${queueItems.map(q => `<tr style="border-bottom:1px solid var(--border)">
+            <td style="padding:10px">
+              <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">${platformBadge(q.platform)} <span style="font-family:var(--mono);font-size:11px">${esc(q.itemId || '—')}</span></div>
+              <div style="font-size:11px;color:var(--text2);margin-top:4px">${esc((q.title || 'Untitled').slice(0, 72))}</div>
+            </td>
+            <td style="padding:10px">${statusBadge(q.status)}</td>
+            <td style="padding:10px">
+              <div style="font-family:var(--mono);font-size:10px;color:${q.lastFailureType==='interstitial'?'var(--amber)':q.lastFailureType==='selector_miss'?'var(--blue-l)':q.lastFailureType==='failed'?'var(--red-l)':'var(--text2)'}">${esc(q.lastFailureType || '—')}</div>
+              <div style="font-size:11px;color:var(--text2);margin-top:4px;max-width:320px">${esc((q.lastError || '—').slice(0, 90))}</div>
+            </td>
+            <td style="padding:10px;font-family:var(--mono);font-size:11px;color:var(--text2)">${fmtDate(q.nextAttemptAt)}</td>
+            <td style="padding:10px;text-align:center;font-family:var(--mono)">${q.attempts || 0}</td>
+            <td style="padding:10px;text-align:right">
+              ${(q.status === 'retry' || q.status === 'failed') ? `<button class="btn btn-ghost btn-sm" onclick="requeueEnrichment('', ['${esc(q.itemId)}'])">Requeue</button>` : ''}
+            </td>
+          </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>`;
+
+    const header = `<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
+  <span style="font-family:var(--mono);font-size:12px;color:var(--muted)">${S.jobs.length} JOBS</span>
+  <button class="btn btn-ghost btn-sm" onclick="fetchJobs();fetchEnrichmentQueue()">↻ Refresh</button>
+</div>`;
+    const jobsBlock = !S.jobs.length
+        ? `<div class="card"><div class="empty"><div class="empty-icon">📭</div><div class="empty-text">No jobs yet — start a scrape</div></div></div>`
+        : `<div class="job-list fade-in">${S.jobs.map(j => {
+        const query = j.searchType==='keyword' ? j.searchParams?.keyword : j.searchParams?.categoryName;
+        const progress = j.progress?.productsScraped || 0;
+        const total    = j.searchParams?.maxProducts || 100;
+        const pct      = Math.min(100, Math.round((progress/total)*100));
+        return `<div class="job-row">
+      <div>${platformBadge(j.platform)}</div>
+      <div>
+        <div class="job-name">${esc(query||'—')}</div>
+        <div class="job-id">${esc(j.jobId)}</div>
+        ${j.status==='running' ? `
+        <div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div>
+        <div class="progress-label">${progress} / ${total} products · Page ${j.progress?.currentPage||0}</div>` : ''}
+        ${j.error ? `<div style="font-size:11px;color:var(--red-l);margin-top:4px;font-family:var(--mono)">${esc(j.error.substring(0,120))}</div>` : ''}
+        ${j.status==='captcha_required' ? `<div style="margin-top:8px;padding:10px 12px;background:rgba(240,165,0,0.08);border:1px solid rgba(240,165,0,0.22);border-radius:8px">
+          <div style="font-size:12px;color:var(--text2);line-height:1.55">${esc(j.captcha?.message || 'Manual CAPTCHA input required')}</div>
+          <div style="font-size:10px;color:var(--muted);font-family:var(--mono);margin-top:6px">${esc(j.captcha?.source || 'search')}</div>
+        </div>` : ''}
+      </div>
+      <div>${statusBadge(j.status)}</div>
+      <div class="job-meta">
+        ${j.status==='completed' ? `<span style="color:var(--green-l);font-family:var(--mono);font-size:11px">${j.results?.totalProducts||0} saved</span>` : ''}
+        ${j.status==='running'   ? `<button class="btn btn-danger btn-sm" onclick="cancelJob('${esc(j.jobId)}')">Cancel</button>` : ''}
+        ${j.status==='captcha_required' ? `<button class="btn btn-primary btn-sm" onclick="resumeCaptchaJob('${esc(j.jobId)}')">Continue</button>` : ''}
+        ${j.status==='captcha_required' ? `<button class="btn btn-danger btn-sm" style="margin-top:6px" onclick="cancelJob('${esc(j.jobId)}')">Cancel</button>` : ''}
+        <div style="margin-top:4px">${fmtDate(j.createdAt)}</div>
+      </div>
+    </div>`;
+    }).join('')}</div>`;
+    return header + jobsBlock + queueHeader + queueBlock;
+}
+
+function renderProductsView() {
+    const filtersHtml = `<div class="card" style="margin-bottom:14px">
+  <div class="filter-row" style="margin-bottom:10px">
+    <div class="form-group" style="min-width:130px">
+      <label>Platform</label>
+      <select onchange="S.filters.platform=this.value;S.filters.page=1;fetchProducts()">
+        <option value="" ${!S.filters.platform?'selected':''}>All</option>
+        ${['taobao','tmall','1688','alibaba'].map(p => `<option value="${p}" ${S.filters.platform===p?'selected':''}>${p}</option>`).join('')}
+      </select>
+    </div>
+    <div class="form-group" style="min-width:140px">
+      <label>Details</label>
+      <select onchange="S.filters.detailsScraped=this.value;S.filters.page=1;fetchProducts()">
+        <option value="" ${S.filters.detailsScraped===''?'selected':''}>All</option>
+        <option value="true"  ${S.filters.detailsScraped==='true'?'selected':''}>With Details</option>
+        <option value="false" ${S.filters.detailsScraped==='false'?'selected':''}>Without</option>
+      </select>
+    </div>
+    <div class="form-group" style="min-width:130px">
+      <label>Min Quality</label>
+      <select onchange="S.filters.minQuality=this.value;S.filters.page=1;fetchProducts()">
+        <option value="" ${!S.filters.minQuality?'selected':''}>Any</option>
+        <option value="80">High (80%+)</option>
+        <option value="50">Medium (50%+)</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label>&nbsp;</label>
+      <button class="btn btn-ghost" onclick="S.filters={platform:'',keyword:'',shopName:'',detailsScraped:'',minQuality:'',page:1,limit:20};fetchProducts()">Clear</button>
+    </div>
+  </div>
+  <div class="grid-2">
+    <input type="text" placeholder="Search keyword…" value="${esc(S.filters.keyword)}"
+      oninput="S.filters.keyword=this.value"
+      onkeydown="if(event.key==='Enter'){S.filters.page=1;fetchProducts()}" />
+    <input type="text" placeholder="Shop name…" value="${esc(S.filters.shopName)}"
+      oninput="S.filters.shopName=this.value"
+      onkeydown="if(event.key==='Enter'){S.filters.page=1;fetchProducts()}" />
+  </div>
+</div>`;
+
+    if (S.loading) return filtersHtml + `<div class="card"><div class="empty"><div class="empty-icon">⏳</div><div class="empty-text">Loading…</div></div></div>`;
+    if (!S.products.length) return filtersHtml + `<div class="card"><div class="empty"><div class="empty-icon">📦</div><div class="empty-text">No products found</div></div></div>`;
+
+    return filtersHtml + `
+<div class="product-grid fade-in">
+  ${S.products.map(p => {
+        const shop = p.shopInfo?.shopName || p.shopName || '';
+        const q    = p.extractionQuality;
+        // ── Safe: only embed itemId (a numeric string) in onclick ──
+        return `<div class="product-card" onclick="openProduct('${esc(p.itemId)}')">
+      <img class="product-img" src="${esc(p.image||'')}" alt="" onerror="this.style.display='none'" loading="lazy"/>
+      <div class="product-body">
+        <div style="display:flex;gap:5px;flex-wrap:wrap">
+          ${platformBadge(p.platform)}
+          ${p.detailsScraped ? '<span class="badge badge-success">✓ Detail</span>' : ''}
+        </div>
+        <div class="product-title">${esc(p.title)}</div>
+        <div class="product-price">¥${esc(p.price||'—')}</div>
+        ${shop ? `<div class="product-meta">🏪 ${esc(shop)}</div>` : ''}
+        ${p.salesCount ? `<div class="product-meta">📦 ${esc(p.salesCount)} sold</div>` : ''}
+        ${q ? `<div>
+          <div style="display:flex;justify-content:space-between;font-size:10px;font-family:var(--mono);color:var(--muted);margin-bottom:3px">
+            <span>Quality</span><span style="color:${qualityColor(q)}">${q}%</span>
+          </div>
+          <div class="quality-bar"><div class="quality-fill" style="width:${q}%;background:${qualityColor(q)}"></div></div>
+        </div>` : ''}
+      </div>
+      <div class="product-footer">
+        ${!p.detailsScraped ? `<button class="btn btn-primary" onclick="event.stopPropagation();scrapeDetails('${esc(p.itemId)}')">+ Details</button>` : ''}
+        <button class="btn btn-ghost" onclick="event.stopPropagation();openProduct('${esc(p.itemId)}')">View →</button>
+      </div>
+    </div>`;
+    }).join('')}
+</div>
+<div class="pagination">
+  <button class="btn btn-ghost btn-sm" onclick="S.filters.page--;fetchProducts()" ${S.filters.page<=1?'disabled':''}>← Prev</button>
+  <span class="page-info">Page ${S.pagination.page||1} · ${(S.pagination.total||0).toLocaleString()} total</span>
+  <button class="btn btn-ghost btn-sm" onclick="S.filters.page++;fetchProducts()" ${S.filters.page>=(S.pagination.pages||1)?'disabled':''}>Next →</button>
+</div>
+<div style="display:flex;gap:8px;margin-top:10px;justify-content:flex-end">
+  <button class="btn btn-ghost btn-sm" onclick="exportProducts('json')">Export JSON</button>
+  <button class="btn btn-ghost btn-sm" onclick="exportProducts('csv')">Export CSV</button>
+  <button class="btn btn-ghost btn-sm" onclick="exportProducts('excel')">Export Excel</button>
+</div>`;
+}
+
+function renderStatsView() {
+    if (S.loading && !S.stats) return `<div class="card"><div class="empty"><div class="empty-icon">⏳</div><div class="empty-text">Loading…</div></div></div>`;
+    if (!S.stats) return `<div class="card"><div class="empty"><div class="empty-icon">📊</div><div class="empty-text">No data yet</div></div></div>`;
+    const s = S.stats;
+    return `<div class="fade-in" style="display:flex;flex-direction:column;gap:14px">
+  <div class="grid-3">
+    <div class="stat-card"><div class="stat-label">Total Products</div><div class="stat-value">${(s.totalProducts||0).toLocaleString()}</div></div>
+    <div class="stat-card"><div class="stat-label">With Details</div><div class="stat-value">${(s.productsWithDetails||0).toLocaleString()}</div></div>
+    <div class="stat-card"><div class="stat-label">Completion</div><div class="stat-value">${s.detailsPercentage||'0.00'}%</div></div>
+  </div>
+  <div class="grid-2">
+    <div class="card">
+      <div class="card-title">By Platform</div>
+      ${(s.byPlatform||[]).map(i => `<div class="detail-row"><span>${platformBadge(i._id)}</span><span style="font-family:var(--mono);font-size:13px">${(i.count||0).toLocaleString()}</span></div>`).join('')
+        || '<div class="empty" style="padding:20px"><div class="empty-text">No data</div></div>'}
+    </div>
+    <div class="card">
+      <div class="card-title">Top Categories</div>
+      ${(s.topCategories||[]).map(i => `<div class="detail-row"><span style="font-size:13px">${esc(i._id||'Uncategorized')}</span><span style="font-family:var(--mono);font-size:13px">${(i.count||0).toLocaleString()}</span></div>`).join('')
+        || '<div class="empty" style="padding:20px"><div class="empty-text">No data</div></div>'}
+    </div>
+  </div>
+</div>`;
+}
+
+function renderBatchView() {
+    return `<div class="fade-in" style="max-width:580px">
+  <div class="card">
+    <div class="card-title">Mode</div>
+    <div class="seg-group" style="width:100%;margin-bottom:20px">
+      ${['pending','all','low'].map(m => `
+      <button class="seg-btn${S.batch.mode===m?' active':''}" style="flex:1"
+        onclick="S.batch.mode='${m}';renderView()">${m === 'pending' ? 'Pending' : m === 'all' ? 'All' : 'Low Quality'}</button>`).join('')}
+    </div>
+    <div style="padding:8px 12px;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);font-size:12px;color:var(--text2);margin-bottom:20px;line-height:1.6">
+      ${S.batch.mode === 'pending' ? '📋 Only products that haven\'t been detail-scraped yet' :
+        S.batch.mode === 'all' ? '🔄 Re-scrape all products matching filters (overwrites existing details)' :
+        '⚠ Only products with extraction quality below threshold'}
+    </div>
+
+    <div class="card-title">Platform Filter</div>
+    <div class="seg-group" style="width:100%;margin-bottom:20px">
+      <button class="seg-btn${!S.batch.platform?' active':''}" style="flex:1"
+        onclick="S.batch.platform='';renderView()">All</button>
+      ${['taobao','tmall','1688','alibaba'].map(p => `
+      <button class="seg-btn${S.batch.platform===p?' active':''}" style="flex:1"
+        onclick="S.batch.platform='${p}';renderView()">${p}</button>`).join('')}
+    </div>
+
+    <div class="grid-2" style="margin-bottom:16px">
+      <div class="form-group">
+        <label>Keyword Filter</label>
+        <input type="text" value="${esc(S.batch.keyword)}"
+          oninput="S.batch.keyword=this.value"
+          placeholder="Filter by search keyword" />
+      </div>
+      <div class="form-group">
+        <label>Category Filter</label>
+        <input type="text" value="${esc(S.batch.categoryName)}"
+          oninput="S.batch.categoryName=this.value"
+          placeholder="Filter by category name" />
+      </div>
+    </div>
+
+    <div class="grid-2" style="margin-bottom:16px">
+      <div class="form-group">
+        <label>Limit (products)</label>
+        <input type="number" value="${esc(S.batch.limit)}"
+          oninput="S.batch.limit=this.value" min="1"
+          placeholder="All matching" />
+      </div>
+      <div class="form-group">
+        <label>Min Quality ${S.batch.mode !== 'low' ? '<span style="color:var(--muted)">(low mode)</span>' : ''}</label>
+        <select onchange="S.batch.minQuality=this.value;renderView()">
+          <option value="" ${!S.batch.minQuality?'selected':''}>Default (50)</option>
+          <option value="30" ${S.batch.minQuality==='30'?'selected':''}>30%</option>
+          <option value="50" ${S.batch.minQuality==='50'?'selected':''}>50%</option>
+          <option value="70" ${S.batch.minQuality==='70'?'selected':''}>70%</option>
+          <option value="80" ${S.batch.minQuality==='80'?'selected':''}>80%</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="card-title">Delay Between Requests</div>
+    <div class="grid-2" style="margin-bottom:20px">
+      <div class="form-group">
+        <label>Min Delay (ms)</label>
+        <input type="number" value="${S.batch.delayMin}" min="1000" step="1000"
+          oninput="S.batch.delayMin=Math.max(1000,parseInt(this.value)||5000)" />
+      </div>
+      <div class="form-group">
+        <label>Max Delay (ms)</label>
+        <input type="number" value="${S.batch.delayMax}" min="2000" step="1000"
+          oninput="S.batch.delayMax=Math.max(2000,parseInt(this.value)||12000)" />
+      </div>
+    </div>
+
+    <div class="form-group" style="margin-bottom:20px">
+      <label>Translate To</label>
+      <select onchange="S.batch.language=this.value" style="width:100%;padding:8px 10px;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);color:var(--text);font-size:13px">
+        ${['en','zh','th','ja','ko','ru'].map(l => `<option value="${l}"${S.batch.language===l?' selected':''}>${
+          {en:'English',zh:'Chinese (no translation)',th:'Thai',ja:'Japanese',ko:'Korean',ru:'Russian'}[l]
+        }</option>`).join('')}
+      </select>
+    </div>
+
+    <button class="btn btn-primary btn-full" onclick="startBatchDetails()" ${S.batchLoading?'disabled':''}>
+      ${S.batchLoading ? '⏳ Starting…' : '▶ Start Batch Detail Scraping'}
+    </button>
+  </div>
+</div>`;
+}
+
+function renderSearchView() {
+    return `<div style="max-width:840px">
+  <div class="search-row">
+    <input id="search-input" class="search-input" type="text" autocomplete="off"
+      value="${esc(S.search.query)}"
+      placeholder="Search products by title, description, shop…"
+      oninput="onSearchInput(this.value)"
+      onkeydown="if(event.key==='Enter') executeSearch(0)" />
+    <button class="btn btn-primary" onclick="executeSearch(0)" ${S.searchLoading?'disabled':''}>
+      ${S.searchLoading ? '⏳' : '⌕ Search'}
+    </button>
+    ${S.search.query ? `<button class="btn btn-ghost" onclick="S.search.query='';S.searchResults=null;document.getElementById('search-input').value='';patchSearchResults()">✕</button>` : ''}
+  </div>
+  <div id="search-results">${buildSearchResultsHTML()}</div>
+</div>`;
+}
+
+function renderSettingsView() {
+    return `<div class="fade-in" style="max-width:600px;display:flex;flex-direction:column;gap:14px">
+  <div class="card">
+    <div class="card-title">API Key</div>
+    <p style="color:var(--text2);font-size:13px;margin-bottom:12px">Set your API key for authenticated access. Stored in browser localStorage.</p>
+    <div class="form-group" style="margin-bottom:12px">
+      <input type="password" id="api-key-input" value="${esc(getApiKey())}"
+        placeholder="Enter API key (leave empty for open access)"
+        style="font-family:var(--mono);font-size:12px" />
+    </div>
+    <div style="display:flex;gap:8px">
+      <button class="btn btn-primary" onclick="localStorage.setItem('scraper_api_key',document.getElementById('api-key-input').value);renderView()">Save</button>
+      <button class="btn btn-ghost" onclick="localStorage.removeItem('scraper_api_key');document.getElementById('api-key-input').value='';renderView()">Clear</button>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-title">MongoDB Migrations</div>
+    <p style="color:var(--text2);font-size:13px;margin-bottom:16px">Run schema migrations to update your MongoDB collection structure (v2→v4).</p>
+    <button class="btn btn-primary" onclick="runMigrations()" ${S.loading?'disabled':''}>Run MongoDB Migrations</button>
+  </div>
+  <div class="card">
+    <div class="card-title">MongoDB → PostgreSQL</div>
+    <p style="color:var(--text2);font-size:13px;margin-bottom:16px">Stream all MongoDB data into a normalised PostgreSQL schema. Upsert-safe — re-runnable without data loss.</p>
+    <div style="display:flex;gap:10px;margin-bottom:16px">
+      <button class="btn btn-primary" onclick="runPgMigration(false)" ${S.migrationRunning?'disabled':''}>
+        ${S.migrationRunning ? '⏳ Running…' : '▶ Run PG Migration'}
+      </button>
+      <button class="btn btn-ghost" onclick="runPgMigration(true)" ${S.migrationRunning?'disabled':''}>Force Re-migrate</button>
+    </div>
+    ${S.migrationLog.length || S.migrationRunning ? `<div id="migration-log" class="migration-log">
+      ${S.migrationLog.map(l => `<div class="log-${l.type}">${esc(l.msg)}</div>`).join('')}
+    </div>` : ''}
+  </div>
+  <div class="card">
+    <div class="card-title">Verify Migration</div>
+    <p style="color:var(--text2);font-size:13px;margin-bottom:16px">Compare document counts between MongoDB and PostgreSQL.</p>
+    <button class="btn btn-ghost" onclick="verifyMigration()">Check Counts</button>
+    <div id="verify-output"></div>
+  </div>
+</div>`;
+}
+
+function renderSessionsView() {
+    if (S.sessionLoading && !S.sessionStatus)
+        return `<div class="card"><div class="empty"><div class="empty-icon">⏳</div><div class="empty-text">Checking sessions…</div></div></div>`;
+
+    const statusColor = s => ({ ok:'var(--green-l)', expiring:'var(--amber)' }[s] || 'var(--red-l)');
+    const statusIcon  = s => ({ ok:'✅', expiring:'⚠️', missing:'🔑' }[s] || '❌');
+
+    const renderCard = (key, info) => {
+        if (!info) return '';
+        const isAlibaba = key === 'alibaba';
+        const isPair = key === 'taobao_tmall';
+        const platforms = isPair
+            ? `<span class="badge badge-taobao" style="margin-right:4px">taobao</span><span class="badge badge-tmall">tmall</span>`
+            : isAlibaba
+            ? `<span class="badge badge-alibaba">alibaba</span>`
+            : `<span class="badge badge-1688">1688</span>`;
+        const platKey = isPair ? 'taobao' : key;
+
+        if (isAlibaba) {
+            return `<div class="card" style="border-left:3px solid var(--green-l);opacity:0.75">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+        <span style="font-size:20px">🌐</span>
+        <div>
+          <div style="display:flex;gap:6px;align-items:center;margin-bottom:4px">${platforms}</div>
+          <div style="font-family:var(--mono);font-size:10px;color:var(--muted)">No login required</div>
+        </div>
+        <div style="margin-left:auto;font-family:var(--mono);font-size:11px;font-weight:600;color:var(--green-l)">GUEST</div>
+      </div>
+      <div style="font-size:12px;color:var(--text2);padding:10px 14px;background:rgba(34,197,94,0.06);border:1px solid rgba(34,197,94,0.2);border-radius:var(--radius)">
+        Alibaba.com scrapes in guest mode — no cookies or QR login needed.
+      </div>
+    </div>`;
+        }
+
+        return `<div class="card" style="border-left:3px solid ${statusColor(info.status)}">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
+        <div style="display:flex;align-items:center;gap:10px">
+          <span style="font-size:22px">${statusIcon(info.status)}</span>
+          <div>
+            <div style="display:flex;gap:6px;align-items:center;margin-bottom:4px">${platforms}</div>
+            <div style="font-family:var(--mono);font-size:10px;color:var(--muted)">${esc(info.file||'')}</div>
+          </div>
+        </div>
+        <div style="text-align:right">
+          <div style="font-family:var(--mono);font-size:11px;font-weight:600;color:${statusColor(info.status)}">${(info.status||'').toUpperCase()}</div>
+          ${info.total ? `<div style="font-family:var(--mono);font-size:10px;color:var(--muted);margin-top:2px">${info.total} cookies</div>` : ''}
+        </div>
+      </div>
+      <div style="background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);padding:12px 14px;margin-bottom:14px">
+        <div style="font-size:12px;color:${statusColor(info.status)}">${esc(info.message||'')}</div>
+        ${info.expiresInHours != null && info.status !== 'expired' ? `
+        <div style="font-family:var(--mono);font-size:10px;color:var(--muted);margin-top:6px">
+          Earliest expiry: <span style="color:${statusColor(info.status)}">${info.expiresInHours}h</span>
+        </div>` : ''}
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn btn-ghost btn-sm" onclick="startQrLogin('${platKey}')">📱 QR Login</button>
+        <button class="btn btn-ghost btn-sm" onclick="exportCookies('${platKey}')">📤 Export</button>
+        <button class="btn btn-ghost btn-sm" style="color:var(--red-l)" onclick="clearCookies('${platKey}')">🗑 Clear</button>
+        <button class="btn btn-ghost btn-sm" onclick="fetchSessionStatus()">↻ Refresh</button>
+      </div>
+    </div>`;
+    };
+
+    const st = S.sessionStatus;
+    return `<div class="fade-in" style="max-width:640px;display:flex;flex-direction:column;gap:14px">
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:2px">
+    <span style="font-family:var(--mono);font-size:11px;color:var(--muted)">LOGIN SESSION HEALTH</span>
+    <button class="btn btn-ghost btn-sm" onclick="fetchSessionStatus()">↻ Refresh</button>
+  </div>
+  <div style="background:rgba(37,99,235,0.06);border:1px solid rgba(37,99,235,0.2);border-radius:var(--radius);padding:12px 16px;font-size:12px;color:var(--text2);line-height:1.7">
+    <strong style="color:var(--text)">Cookie files:</strong><br>
+    Taobao &amp; Tmall → <code style="font-family:var(--mono);color:var(--amber)">utils/cookies.json</code><br>
+    1688 → <code style="font-family:var(--mono);color:var(--blue-l)">utils/cookies-1688.json</code><br>
+    Alibaba → <span style="color:var(--green-l)">no cookies needed</span>
+  </div>
+  ${st ? renderCard('taobao_tmall', st.taobao_tmall) : ''}
+  ${st ? renderCard('1688', st['1688']) : ''}
+  ${renderCard('alibaba', {})}
+  ${!st ? `<div class="card"><div class="empty"><div class="empty-icon">🔑</div><div class="empty-text">No session data — click Refresh</div></div></div>` : ''}
+
+  <div style="margin-top:10px">
+    <span style="font-family:var(--mono);font-size:11px;color:var(--muted)">IMPORT COOKIES</span>
+  </div>
+  <div class="card">
+    <div style="font-size:12px;color:var(--text2);margin-bottom:12px;line-height:1.6">
+      Paste cookies exported from a browser extension (e.g. <strong style="color:var(--text)">Cookie-Editor</strong>,
+      <strong style="color:var(--text)">EditThisCookie</strong>). Export as JSON array, then paste below.
+    </div>
+    <div style="display:flex;gap:8px;margin-bottom:10px;align-items:center">
+      <label style="font-family:var(--mono);font-size:10px;color:var(--muted)">PLATFORM</label>
+      <select style="background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);padding:4px 8px;color:var(--text);font-size:12px"
+              onchange="S.cookieImport.platform=this.value">
+        <option value="taobao" ${S.cookieImport.platform==='taobao'?'selected':''}>Taobao / Tmall</option>
+        <option value="1688" ${S.cookieImport.platform==='1688'?'selected':''}>1688</option>
+        <!-- Alibaba uses guest mode — no cookies needed -->
+      </select>
+    </div>
+    <textarea id="cookie-import-text" rows="6"
+      placeholder='[{"name":"cookie_name","value":"cookie_value","domain":".taobao.com",...}]'
+      style="width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);padding:10px;color:var(--text);font-family:var(--mono);font-size:11px;resize:vertical;margin-bottom:10px"
+      oninput="S.cookieImport.text=this.value">${esc(S.cookieImport.text)}</textarea>
+    <button class="btn btn-primary btn-sm" onclick="importCookies()">📥 Import Cookies</button>
+  </div>
+
+  <div style="margin-top:10px">
+    <span style="font-family:var(--mono);font-size:11px;color:var(--muted)">PROXY POOL</span>
+  </div>
+  ${(() => {
+    const px = S.proxyStatus;
+    if (!px) return `<div class="card"><div class="empty"><div class="empty-text">No proxy data — click Refresh</div></div></div>`;
+
+    const gatewayForm = `<div style="margin-top:14px;padding-top:14px;border-top:1px solid var(--border)">
+      <div style="font-family:var(--mono);font-size:10px;color:var(--muted);margin-bottom:8px">ROTATING GATEWAY</div>
+      <div style="font-size:11px;color:var(--text2);margin-bottom:8px;line-height:1.5">
+        A single endpoint where the <strong style="color:var(--text)">provider rotates IPs</strong> for you.
+        Works with Smartproxy, Bright Data, Oxylabs, IPRoyal, 922proxy, etc.
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px">
+        <input id="gateway-input" type="text" placeholder="http://user:pass@gate.smartproxy.com:7777"
+          style="flex:1;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);padding:6px 10px;color:var(--text);font-family:var(--mono);font-size:11px" />
+        <button class="btn btn-primary btn-sm" onclick="setGateway()">Set</button>
+      </div>
+      <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
+        <input id="gateway-sticky" type="checkbox" style="accent-color:var(--amber)" />
+        <label style="font-size:11px;color:var(--text2);cursor:pointer" onclick="document.getElementById('gateway-sticky').click()">
+          Sticky sessions (same IP per job — appends <code style="font-family:var(--mono);font-size:10px">-session-ID</code> to username)
+        </label>
+      </div>
+    </div>`;
+
+    const addForm = `<div style="margin-top:14px;padding-top:14px;border-top:1px solid var(--border)">
+      <div style="font-family:var(--mono);font-size:10px;color:var(--muted);margin-bottom:8px">ADD STATIC PROXY</div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <input id="proxy-input" type="text" placeholder="protocol://user:pass@host:port"
+          style="flex:1;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);padding:6px 10px;color:var(--text);font-family:var(--mono);font-size:11px" />
+        <button class="btn btn-primary btn-sm" onclick="addProxy()">Add</button>
+      </div>
+      <div style="font-size:10px;color:var(--muted);margin-top:6px">
+        Static proxies that <strong>you</strong> rotate. For provider-managed rotation, use Gateway above.
+      </div>
+    </div>`;
+
+    const providerForm = `<div style="margin-top:14px;padding-top:14px;border-top:1px solid var(--border)">
+      <div style="font-family:var(--mono);font-size:10px;color:var(--muted);margin-bottom:8px">JSON PROVIDER API</div>
+      <div style="font-size:11px;color:var(--text2);margin-bottom:8px;line-height:1.5">
+        Fetches proxies from a provider URL that returns JSON like <code style="font-family:var(--mono);font-size:10px">[{ "host": "...", "port": "..." }]</code>.
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+        <input id="provider-url-input" type="text" value="${esc(px.provider?.url || '')}" placeholder="https://white.1024proxy.com/white/api?region=TW&num=1&format=1&type=json"
+          style="flex:1;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);padding:6px 10px;color:var(--text);font-family:var(--mono);font-size:11px" />
+      </div>
+      <div style="display:grid;grid-template-columns:110px 1fr 1fr;gap:8px;margin-bottom:8px">
+        <select id="provider-protocol-input" style="background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);padding:6px 10px;color:var(--text);font-size:11px">
+          ${['http','https','socks5'].map(p => `<option value="${p}"${(px.provider?.protocol || 'http')===p?' selected':''}>${p}</option>`).join('')}
+        </select>
+        <input id="provider-username-input" type="text" value="${esc(px.provider?.username || '')}" placeholder="username (optional)"
+          style="background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);padding:6px 10px;color:var(--text);font-family:var(--mono);font-size:11px" />
+        <input id="provider-password-input" type="password" value="${esc(px.provider?.password || '')}" placeholder="password (optional)"
+          style="background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);padding:6px 10px;color:var(--text);font-family:var(--mono);font-size:11px" />
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px">
+        <input id="provider-refresh-interval-input" type="number" min="30" value="${esc(px.provider?.refreshIntervalSec || 300)}" placeholder="refresh seconds"
+          style="background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);padding:6px 10px;color:var(--text);font-family:var(--mono);font-size:11px" />
+        <input id="provider-min-available-input" type="number" min="1" value="${esc(px.provider?.minAvailable || 2)}" placeholder="min available proxies"
+          style="background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);padding:6px 10px;color:var(--text);font-family:var(--mono);font-size:11px" />
+      </div>
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">
+        <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text2)">
+          <input id="provider-replace-input" type="checkbox" style="accent-color:var(--amber)" ${px.provider ? 'checked' : 'checked'} />
+          Replace older provider proxies on refresh
+        </label>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn btn-primary btn-sm" onclick="setProxyProvider()">Save & Fetch</button>
+          <button class="btn btn-ghost btn-sm" onclick="refreshProxyProvider()">Refresh</button>
+          <button class="btn btn-danger btn-sm" onclick="clearProxyProvider()">Remove</button>
+        </div>
+      </div>
+    </div>`;
+
+    const statusBorder = px.enabled ? 'var(--green-l)' : 'var(--muted)';
+    const statusIcon = px.enabled ? '🔀' : '🔓';
+    const modeLabel = px.mode === 'gateway' ? 'Gateway' : px.mode === 'pool' ? 'Static Pool' : '';
+    const statusTitle = px.enabled ? `Proxy Active — ${modeLabel}${px.stickySessions ? ' (sticky)' : ''}` : 'Proxy Rotation Disabled';
+    const statusSub = px.enabled
+      ? `${px.available} available / ${px.total} total / ${px.dead} dead`
+      : 'No proxies configured — set up a gateway or add static proxies below';
+
+    return `<div class="card" style="border-left:3px solid ${statusBorder}">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
+        <div style="display:flex;align-items:center;gap:10px">
+          <span style="font-size:20px">${statusIcon}</span>
+          <div>
+            <div style="font-size:13px;font-weight:500">${statusTitle}</div>
+            <div style="font-family:var(--mono);font-size:10px;color:var(--muted)">${statusSub}</div>
+          </div>
+        </div>
+      </div>
+      ${px.proxies.length ? `<div style="overflow-x:auto">
+        <table style="width:100%;font-size:12px;border-collapse:collapse">
+          <thead><tr style="border-bottom:1px solid var(--border)">
+            <th style="text-align:left;padding:6px 8px;font-family:var(--mono);font-size:10px;color:var(--muted)">HOST</th>
+            <th style="text-align:center;padding:6px 8px;font-family:var(--mono);font-size:10px;color:var(--muted)">TYPE</th>
+            <th style="text-align:center;padding:6px 8px;font-family:var(--mono);font-size:10px;color:var(--muted)">PROTO</th>
+            <th style="text-align:center;padding:6px 8px;font-family:var(--mono);font-size:10px;color:var(--muted)">REQS</th>
+            <th style="text-align:center;padding:6px 8px;font-family:var(--mono);font-size:10px;color:var(--muted)">SUCCESS</th>
+            <th style="text-align:center;padding:6px 8px;font-family:var(--mono);font-size:10px;color:var(--muted)">STATUS</th>
+            <th style="text-align:center;padding:6px 8px;font-family:var(--mono);font-size:10px;color:var(--muted)"></th>
+          </tr></thead>
+          <tbody>${px.proxies.map(p => `<tr style="border-bottom:1px solid var(--border)">
+            <td style="padding:6px 8px;font-family:var(--mono)">${esc(p.host)}</td>
+            <td style="text-align:center;padding:6px 8px"><span style="font-size:10px;padding:2px 6px;border-radius:3px;background:${p.type==='gateway'?'rgba(96,165,250,0.15);color:var(--blue-l)':'rgba(160,168,181,0.15);color:var(--text2)'}">${p.type}</span></td>
+            <td style="text-align:center;padding:6px 8px">${p.protocol}</td>
+            <td style="text-align:center;padding:6px 8px;font-family:var(--mono)">${p.requests}</td>
+            <td style="text-align:center;padding:6px 8px;font-family:var(--mono);color:${p.successRate>=80?'var(--green-l)':p.successRate>=50?'var(--amber)':'var(--red-l)'}">${p.successRate}%</td>
+            <td style="text-align:center;padding:6px 8px">${p.dead?'<span style="color:var(--red-l)">DEAD</span>':'<span style="color:var(--green-l)">OK</span>'}</td>
+            <td style="text-align:center;padding:6px 4px"><button class="btn btn-ghost btn-sm" style="color:var(--red-l);padding:2px 6px;font-size:10px" onclick="removeProxy('${esc(p.host)}')">✕</button></td>
+          </tr>`).join('')}</tbody>
+        </table>
+      </div>` : ''}
+      ${gatewayForm}
+      ${providerForm}
+      ${addForm}
+    </div>`;
+  })()}
+</div>`;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MAIN RENDER
+// ═══════════════════════════════════════════════════════════════════════════
+function renderView() {
+    const views = {
+        scrape:renderScrapeView, batch:renderBatchView, jobs:renderJobsView,
+        products:renderProductsView, stats:renderStatsView, search:renderSearchView,
+        sessions:renderSessionsView, settings:renderSettingsView,
+        categories:renderCategoriesView,
+    };
+    const root = document.getElementById('view-root');
+    if (!root) return;
+    if (S.tab === 'search' && document.getElementById('search-input')) { patchSearchResults(); return; }
+    root.innerHTML = (views[S.tab] || renderScrapeView)();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CATEGORIES VIEW
+// ═══════════════════════════════════════════════════════════════════════════
+function renderCategoriesView() {
+    const cv = S.categoriesView;
+    const tree = S.categoryTree[cv.platform] || [];
+
+    return `<div class="fade-in" style="max-width:720px">
+  <div class="card" style="margin-bottom:16px">
+    <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px">
+      <div class="seg-group">
+        ${['taobao','tmall','1688','alibaba'].map(p => `
+        <button class="seg-btn${cv.platform===p?' active':''}"
+          onclick="setCategoriesViewPlatform('${p}')">${p}</button>`).join('')}
+      </div>
+      <div style="display:flex;gap:8px">
+        <button class="btn btn-ghost btn-sm" onclick="seedCategories()">
+          ${cv.seeding ? '⏳ Seeding…' : '⟳ Seed Categories'}
+        </button>
+        <button class="btn btn-ghost btn-sm" onclick="discoverCategories()">⚡ Discover</button>
+      </div>
+    </div>
+    <div style="font-size:11px;color:var(--muted);margin-top:8px;font-family:var(--mono)">
+      ${tree.length} groups · ${tree.reduce((n,g)=>n+(g.subCategories||[]).length,0)} sub-categories
+    </div>
+  </div>
+
+  ${tree.length === 0 ? `
+  <div class="card"><div class="empty">
+    <div class="empty-icon">🏷</div>
+    <div class="empty-text">No categories loaded — click "Seed Categories" to populate</div>
+  </div></div>` : tree.map((group, idx) => {
+    const isOpen = cv.openGroup === group.groupId;
+    const subs   = group.subCategories || [];
+    return `
+  <div class="card" style="margin-bottom:8px;padding:0">
+    <div onclick="toggleCategoryGroup('${esc(group.groupId)}')"
+      style="padding:12px 16px;cursor:pointer;display:flex;align-items:center;justify-content:space-between;user-select:none">
+      <div style="display:flex;align-items:center;gap:12px">
+        <span style="font-size:13px;font-weight:600;color:var(--text)">${esc(group.nameZh)}</span>
+        <span style="font-size:12px;color:var(--muted)">${esc(group.nameEn)}</span>
+        <span style="font-size:10px;font-family:var(--mono);color:var(--muted);background:var(--surface2);padding:2px 6px;border-radius:4px">${subs.length} subs</span>
+      </div>
+      <span style="color:var(--muted);font-size:11px">${isOpen ? '▲' : '▼'}</span>
+    </div>
+    ${isOpen ? `
+    <div style="padding:0 16px 14px;border-top:1px solid var(--border)">
+      <div class="chip-wrap" style="margin-top:10px">
+        ${subs.map(sub => `
+        <button class="chip" style="cursor:default" title="${esc(sub.nameEn || sub.subId)}">
+          ${esc(sub.nameZh)}
+          <span style="font-size:10px;color:var(--muted);margin-left:4px">${esc(sub.nameEn)}</span>
+        </button>`).join('')}
+      </div>
+      <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+        <button class="btn btn-ghost btn-sm" onclick="scrapeGroup('${esc(group.groupId)}','${esc(group.nameZh)}','${esc(group.nameEn)}')">
+          ▶ Scrape this group
+        </button>
+      </div>
+    </div>` : ''}
+  </div>`;
+  }).join('')}
+</div>`;
+}
+
+function setCategoriesViewPlatform(platform) {
+    S.categoriesView.platform  = platform;
+    S.categoriesView.openGroup = null;
+    renderView();
+    if (!S.categoryTree[platform] || !S.categoryTree[platform].length) {
+        fetchCategoryTree(platform);
+    }
+}
+
+function toggleCategoryGroup(groupId) {
+    S.categoriesView.openGroup = (S.categoriesView.openGroup === groupId) ? null : groupId;
+    renderView();
+}
+
+async function seedCategories() {
+    if (S.categoriesView.seeding) return;
+    S.categoriesView.seeding = true; renderView();
+    try {
+        const d = await apiFetch('/categories/seed', { method:'POST' });
+        if (d.success) {
+            // Reload trees for all platforms
+            await Promise.all(['taobao','tmall','1688','alibaba'].map(p => fetchCategoryTree(p)));
+        } else { alert(d.error || 'Seed failed'); }
+    } catch(e) { alert(e.message); }
+    S.categoriesView.seeding = false; renderView();
+}
+
+async function discoverCategories() {
+    const platform = S.categoriesView.platform;
+    try {
+        const d = await apiFetch('/categories/discover/' + platform, { method:'POST' });
+        if (d.success) {
+            await fetchCategoryTree(platform);
+        } else { alert(d.error || 'Discover failed'); }
+    } catch(e) { alert(e.message); }
+}
+
+function scrapeGroup(groupId, nameZh, nameEn) {
+    // Navigate to scrape tab with this group pre-selected
+    S.scrape.mode              = 'category';
+    S.scrape.selectedGroup     = groupId;
+    S.scrape.categoryId        = '';
+    S.scrape.groupCategoryId   = groupId;
+    S.scrape.groupCategoryName = nameZh;
+    S.scrape.groupCategoryNameEn = nameEn;
+    const btn = document.querySelector('[onclick*="switchTab(this,\'scrape\')"]');
+    if (btn) switchTab(btn, 'scrape');
+    else { S.tab = 'scrape'; renderView(); }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MODAL
+// ═══════════════════════════════════════════════════════════════════════════
+function closeModal() { S.selected = null; document.getElementById('modal-root').innerHTML = ''; }
+
+function renderModal() {
+    const root = document.getElementById('modal-root');
+    const captchaJob = S.captchaJobId ? S.jobs.find(j => j.jobId === S.captchaJobId) : null;
+    if (captchaJob) {
+        root.innerHTML = `
+<div class="modal-overlay" onclick="if(event.target===this) closeModal()">
+  <div class="modal" style="max-width:760px">
+    <div class="modal-header">
+      <div>
+        <div class="modal-title">Manual CAPTCHA Required</div>
+        <div style="font-size:10px;color:var(--muted);font-family:var(--mono);margin-top:2px">${esc(captchaJob.jobId)}</div>
+      </div>
+      <button class="modal-close" onclick="closeModal()">×</button>
+    </div>
+    <div class="modal-body">
+      <div style="padding:12px 14px;background:rgba(240,165,0,0.08);border:1px solid rgba(240,165,0,0.2);border-radius:10px;margin-bottom:16px">
+        <div style="font-size:13px;color:var(--text);font-weight:600">Solve the CAPTCHA in the visible browser window.</div>
+        <div style="font-size:12px;color:var(--text2);line-height:1.6;margin-top:6px">${esc(captchaJob.captcha?.message || 'This job is paused until the CAPTCHA is completed.')}</div>
+      </div>
+      ${captchaJob.captcha?.screenshot ? `
+      <div style="margin-bottom:16px">
+        <div style="font-size:11px;color:var(--muted);font-family:var(--mono);margin-bottom:8px">Latest screenshot</div>
+        <img src="${captchaJob.captcha.screenshot}" alt="CAPTCHA preview" style="width:100%;border-radius:10px;border:1px solid var(--border);background:var(--surface2)" />
+      </div>` : ''}
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        <button class="btn btn-primary" onclick="resumeCaptchaJob('${esc(captchaJob.jobId)}')">I Solved It, Continue</button>
+        <button class="btn btn-danger" onclick="cancelJob('${esc(captchaJob.jobId)}')">Cancel Job</button>
+      </div>
+    </div>
+  </div>
+</div>`;
+        return;
+    }
+    if (!S.selected) { root.innerHTML = ''; return; }
+    const p  = S.selected;
+    // detailedInfo holds the detail-scrape results; fall back gracefully
+    const d  = p.detailedInfo || {};
+    const dq = d.dataQuality  || {};
+    const q  = p.extractionQuality;
+    // Shop info lives under detailedInfo.shopInfo (from detail scrape)
+    // or top-level shopInfo (older records / search results)
+    const shop       = d.shopInfo || p.shopInfo || {};
+    const sellerInfo = shop.sellerInfo || {};
+
+    const sec = (title, content) => `
+    <div class="modal-section">
+      <div class="modal-section-title">${title}</div>
+      ${content}
+    </div>`;
+
+    // ── Shop block ──────────────────────────────────────────────────────
+    const shopBlock = (shop.shopName || shop.shopLink) ? sec('Shop', `
+    <div style="background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px">
+      ${shop.shopName ? `<div class="detail-row"><span class="detail-key">Name</span><span class="detail-val">${esc(shop.shopName)}</span></div>` : ''}
+      ${shop.shopRating ? `<div class="detail-row"><span class="detail-key">Rating</span><span class="detail-val">${esc(shop.shopRating)} ⭐</span></div>` : ''}
+      ${sellerInfo.positiveFeedbackRate ? `<div class="detail-row"><span class="detail-key">Feedback</span><span class="detail-val">${sellerInfo.positiveFeedbackRate}%</span></div>` : ''}
+      ${sellerInfo.averageDeliveryTime  ? `<div class="detail-row"><span class="detail-key">Avg Ship</span><span class="detail-val">${esc(sellerInfo.averageDeliveryTime)}</span></div>` : ''}
+      ${sellerInfo.serviceSatisfaction  ? `<div class="detail-row"><span class="detail-key">Service</span><span class="detail-val">${sellerInfo.serviceSatisfaction}%</span></div>` : ''}
+      ${shop.shopLink ? `<a href="${esc(shop.shopLink)}" target="_blank" rel="noopener"
+        style="color:var(--amber);font-size:11px;font-family:var(--mono);text-decoration:none;display:inline-block;margin-top:8px">↗ Visit Shop</a>` : ''}
+    </div>`) : '';
+
+    // ── Specifications ──────────────────────────────────────────────────
+    const specsBlock = d.specifications && Object.keys(d.specifications).length ? sec('Specifications', `
+    <div class="spec-grid">
+      ${Object.entries(d.specifications).map(([k,v]) => `
+      <div class="spec-cell"><div class="spec-key">${esc(k)}</div><div class="spec-val">${esc(v)}</div></div>`).join('')}
+    </div>`) : '';
+
+    // ── Variants ────────────────────────────────────────────────────────
+    const variantsBlock = d.variants && Object.keys(d.variants).length ? sec('Variants', `
+    <div style="display:flex;flex-direction:column;gap:14px">
+      ${Object.entries(d.variants).map(([type, opts]) => {
+        const arr = Array.isArray(opts) ? opts : [];
+        return `<div>
+          <div style="font-size:11px;color:var(--muted);font-family:var(--mono);text-transform:uppercase;letter-spacing:0.06em;margin-bottom:7px">${esc(type)}</div>
+          <div style="display:flex;flex-wrap:wrap;gap:5px">
+            ${arr.slice(0, 24).map(o => {
+              if (typeof o === 'string') return `<span class="variant-pill">${esc(o)}</span>`;
+              if (o?.image) return `<img class="variant-img" src="${esc(o.image)}" title="${esc(o.value||'')}" loading="lazy" onerror="this.style.display='none'"/>`;
+              return `<span class="variant-pill">${esc(o?.value || String(o))}</span>`;
+            }).join('')}
+            ${arr.length > 24 ? `<span style="color:var(--muted);font-size:12px;align-self:center;font-family:var(--mono)">+${arr.length-24}</span>` : ''}
+          </div>
+        </div>`;
+      }).join('')}
+    </div>`) : '';
+
+    // ── Images ──────────────────────────────────────────────────────────
+    const imagesBlock = d.additionalImages?.length ? sec(`Images (${d.additionalImages.length})`, `
+    <div class="img-grid">
+      ${d.additionalImages.map(img => `<img class="img-thumb" src="${esc(img)}" loading="lazy" onerror="this.style.display='none'"/>`).join('')}
+    </div>`) : '';
+
+    // ── Guarantees ──────────────────────────────────────────────────────
+    const guaranteesBlock = d.guarantees?.length ? sec('Guarantees', `
+    <div style="display:flex;flex-wrap:wrap;gap:6px">
+      ${d.guarantees.map(g => `<span class="guarantee-chip">✓ ${esc(g)}</span>`).join('')}
+    </div>`) : '';
+
+    // ── Description ─────────────────────────────────────────────────────
+    const descBlock = d.fullDescription ? sec('Description', `
+    <p style="font-size:13px;color:var(--text2);line-height:1.75">
+      ${esc(d.fullDescription.substring(0, 600))}${d.fullDescription.length > 600 ? '…' : ''}
+    </p>`) : '';
+
+    // ── Quality ─────────────────────────────────────────────────────────
+    const qualityBlock = q ? sec('Data Quality', `
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+      <span style="font-size:13px">Completeness</span>
+      <span style="font-family:var(--mono);font-size:16px;font-weight:600;color:${qualityColor(q)}">${q}%</span>
+    </div>
+    <div class="quality-bar" style="height:5px;margin-bottom:14px">
+      <div class="quality-fill" style="width:${q}%;background:${qualityColor(q)}"></div>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(90px,1fr));gap:4px;font-family:var(--mono);font-size:10px">
+      ${['title','price','images','variants','specs','brand','reviews','description','salesVolume','shopName'].map(f => {
+        const key = 'has' + f.charAt(0).toUpperCase() + f.slice(1);
+        const ok  = dq[key];
+        return `<span style="color:${ok?'var(--green-l)':'var(--muted)'}">${ok?'✓':'✗'} ${f}</span>`;
+      }).join('')}
+    </div>`) : '';
+
+    root.innerHTML = `
+<div class="modal-overlay" onclick="if(event.target===this) closeModal()">
+  <div class="modal">
+    <div class="modal-header">
+      <div>
+        <div class="modal-title">${esc(p.itemId)}</div>
+        <div style="font-size:10px;color:var(--muted);font-family:var(--mono);margin-top:2px">${fmtDate(p.extractedAt||p.createdAt||p.updatedAt)}</div>
+      </div>
+      <button class="modal-close" onclick="closeModal()">×</button>
+    </div>
+    <div class="modal-body">
+
+      <!-- Hero row: image + key details side-by-side -->
+      <div class="grid-2" style="align-items:start;gap:20px;margin-bottom:22px">
+        <div>
+          <img src="${esc(p.image||'')}" alt="" onerror="this.style.display='none'"
+            style="width:100%;border-radius:6px;background:var(--surface2);border:1px solid var(--border);aspect-ratio:1;object-fit:cover" loading="lazy"/>
+          ${d.additionalImages?.length ? `
+          <div class="img-grid" style="margin-top:6px;grid-template-columns:repeat(4,1fr)">
+            ${d.additionalImages.slice(0, 8).map(img => `<img class="img-thumb" src="${esc(img)}" loading="lazy" onerror="this.style.display='none'"/>`).join('')}
+          </div>` : ''}
+        </div>
+        <div>
+          <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">
+            ${platformBadge(p.platform)}
+            ${p.detailsScraped ? '<span class="badge badge-success">✓ Detailed</span>' : ''}
+          </div>
+          <div style="font-size:15px;font-weight:600;line-height:1.45;margin-bottom:12px">${esc(d.fullTitle||p.title)}</div>
+          <div style="font-family:var(--mono);font-size:22px;font-weight:600;color:var(--amber);margin-bottom:16px;letter-spacing:-0.02em">
+            ¥${esc(p.price||'—')}
+            ${d.originalPrice ? `<span style="font-size:13px;color:var(--muted);text-decoration:line-through;margin-left:8px;font-weight:400">¥${esc(d.originalPrice)}</span>` : ''}
+          </div>
+          <div>
+            ${d.salesVolume||p.salesCount ? `<div class="detail-row"><span class="detail-key">Sales</span><span class="detail-val">${esc(d.salesVolume||p.salesCount)}</span></div>` : ''}
+            ${d.rating       ? `<div class="detail-row"><span class="detail-key">Rating</span><span class="detail-val">${esc(d.rating)} ★</span></div>` : ''}
+            ${d.reviewCount  ? `<div class="detail-row"><span class="detail-key">Reviews</span><span class="detail-val">${esc(d.reviewCount)}</span></div>` : ''}
+            ${d.brand        ? `<div class="detail-row"><span class="detail-key">Brand</span><span class="detail-val">${esc(d.brand)}</span></div>` : ''}
+            ${p.categoryName ? `<div class="detail-row"><span class="detail-key">Category</span><span class="detail-val">${esc(p.categoryName)}</span></div>` : ''}
+            ${p.location     ? `<div class="detail-row"><span class="detail-key">Location</span><span class="detail-val">${esc(p.location)}</span></div>` : ''}
+          </div>
+          <a href="${esc(p.link||'#')}" target="_blank" rel="noopener"
+            style="display:inline-flex;align-items:center;gap:6px;margin-top:14px;color:var(--amber);font-size:12px;font-family:var(--mono);text-decoration:none;border:1px solid rgba(240,165,0,0.25);padding:6px 12px;border-radius:var(--radius)">
+            ↗ View on Store
+          </a>
+        </div>
+      </div>
+
+      ${shopBlock}
+      ${guaranteesBlock}
+      ${specsBlock}
+      ${variantsBlock}
+      ${imagesBlock}
+      ${descBlock}
+      ${qualityBlock}
+
+      <div class="modal-section">
+        <div class="modal-section-title">Price History</div>
+        <div id="price-history-container" style="font-size:12px;color:var(--muted)">Loading...</div>
+      </div>
+
+    </div>
+  </div>
+</div>`;
+
+    // Fetch price history async after modal renders
+    fetchPriceHistory(p.itemId);
+}
+
+async function fetchPriceHistory(itemId) {
+    const container = document.getElementById('price-history-container');
+    if (!container) return;
+    try {
+        const d = await apiFetch('/prices/product/' + itemId);
+        if (!d.success || !d.data?.length) {
+            container.innerHTML = '<span style="color:var(--muted)">No price history yet</span>';
+            return;
+        }
+        const rows = d.data.slice(0, 20).map(h => {
+            const date = new Date(h.recordedAt).toLocaleDateString('en-US', {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
+            return `<div class="detail-row">
+              <span class="detail-key">${date}</span>
+              <span class="detail-val" style="font-family:var(--mono)">
+                ¥${h.price}${h.priceUsd ? ` <span style="color:var(--muted)">($${h.priceUsd})</span>` : ''}
+              </span>
+            </div>`;
+        }).join('');
+        container.innerHTML = rows;
+    } catch(e) {
+        container.innerHTML = '<span style="color:var(--red-l)">Failed to load</span>';
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// KEYBOARD + BOOT
+// ═══════════════════════════════════════════════════════════════════════════
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+renderView();
+setInterval(() => { if (S.tab === 'jobs') { fetchJobs(); fetchEnrichmentQueue(); } }, 5000);
+// Load category tree for the default platform on boot
+fetchCategoryTree('taobao');
+</script>
+</body>
+</html>

@@ -1,0 +1,14 @@
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+motor>=3.4.0              # async MongoDB driver (mirrors mongoose)
+asyncpg>=0.29.0           # async PostgreSQL driver (mirrors pg/node-postgres)
+pymongo>=4.7.0            # for UpdateOne etc in bulk_write
+python-dotenv>=1.0.0
+sse-starlette>=1.8.0      # Server-Sent Events (mirrors res.write text/event-stream)
+pydantic>=2.6.0
+scrapling[all]>=0.4.5     # replaces puppeteer + cheerio + axios
+httpx>=0.27.0             # async HTTP client for 2Captcha API
+Pillow>=10.0.0            # image processing for CAPTCHA screenshots
+opencv-python-headless>=4.9.0  # slider CAPTCHA gap detection (no GUI deps needed)
+deep-translator>=1.11.0   # Google Translate for product data translation
+openpyxl>=3.1.0           # Excel export
