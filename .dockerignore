@@ -27,6 +27,10 @@ pytest.ini
 
 # Data directory (optional — remove if you want pre-seeded data in the image)
 data/
+!data/
+data/*
+!data/__init__.py
+!data/category_tree.py
 
 # Dev scripts
 debug_cards.py
