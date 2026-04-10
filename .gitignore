@@ -12,7 +12,9 @@ build/
 scrapling-env/
 
 # Data & debug
-data/
+data/*
+!data/__init__.py
+!data/category_tree.py
 debug_*.json
 scraped_html/
 
