@@ -661,9 +661,225 @@ _ALIBABA_TITLE_RE = re.compile(
 _ALIBABA_HREF_RE = re.compile(
     r'href="(//www\.alibaba\.com/product-detail/[^"]*?_(\d{5,})\.html[^"]*)"'
 )
+_ALIBABA_ANY_HREF_RE = re.compile(
+    r'href="((?:https?:)?//www\.alibaba\.com/product-detail/[^"]*?_(\d{5,})\.html[^"]*)"',
+    re.IGNORECASE,
+)
 _ALIBABA_PRICE_RE = re.compile(
     r'US\$\s*([\d,]+\.?\d*)(?:\s*[-–]\s*[\d,]+\.?\d*)?'
 )
+_IMG_TAG_RE = re.compile(r'<img\b[^>]*>', re.IGNORECASE)
+_ATTR_RE = re.compile(r'([\w:-]+)\s*=\s*(["\'])([\s\S]*?)\2')
+_STYLE_URL_RE = re.compile(r'url\((["\']?)([^"\')]+)\1\)', re.IGNORECASE)
+_IMG_SRC_ATTRS = (
+    "data-src",
+    "data-lazy-src",
+    "data-original",
+    "lazy-src",
+    "src",
+    "data-srcset",
+    "srcset",
+)
+_BAD_ALIBABA_IMAGE_MARKERS = (
+    "avatar",
+    "badge",
+    "company",
+    "default",
+    "flag",
+    "icon",
+    "logo",
+    "member",
+    "profile",
+    "qrcode",
+    "shop",
+    "sprite",
+    "store",
+    "supplier",
+    "transparent",
+)
+_PRODUCT_ALIBABA_IMAGE_MARKERS = (
+    "/kf/",
+    "@sc",
+    "alicdn.com",
+    "alibaba.com/img",
+    "product",
+    "offer",
+)
+
+
+def _first_srcset_url(value: str) -> str:
+    first = value.split(",", 1)[0].strip()
+    return first.split()[0] if first else ""
+
+
+def _normalize_image_url(raw: str) -> str:
+    raw = unescape((raw or "").strip())
+    if not raw or raw.startswith(("data:", "blob:", "javascript:")):
+        return ""
+    if "," in raw and " " in raw and not raw.startswith(("http://", "https://", "//")):
+        raw = _first_srcset_url(raw)
+    if raw.startswith("//"):
+        return "https:" + raw
+    if raw.startswith(("http://", "https://")):
+        return raw
+    return ""
+
+
+def _looks_like_alibaba_product_image(url: str, attrs: dict[str, str]) -> bool:
+    haystack = " ".join([
+        url,
+        attrs.get("class", ""),
+        attrs.get("alt", ""),
+        attrs.get("title", ""),
+    ]).lower()
+    if any(marker in haystack for marker in _BAD_ALIBABA_IMAGE_MARKERS):
+        return False
+    if not re.search(r'\.(?:jpg|jpeg|png|webp)(?:[_?./-]|$)', url, re.IGNORECASE):
+        return False
+    return any(marker in haystack for marker in _PRODUCT_ALIBABA_IMAGE_MARKERS)
+
+
+def _score_alibaba_image(url: str, attrs: dict[str, str], attr_name: str) -> int:
+    haystack = " ".join([
+        url,
+        attrs.get("class", ""),
+        attrs.get("alt", ""),
+        attrs.get("title", ""),
+    ]).lower()
+    score = 0
+    if attr_name.startswith("data") or attr_name == "lazy-src":
+        score += 20
+    if "/kf/" in haystack:
+        score += 50
+    if "@sc" in haystack or "alicdn.com" in haystack:
+        score += 25
+    if any(marker in haystack for marker in ("slider", "gallery", "product", "offer", "main")):
+        score += 20
+    if re.search(r'_(?:\d{2,4}x\d{2,4}|q\d+)\.', url, re.IGNORECASE):
+        score += 5
+    return score
+
+
+def _best_alibaba_product_image(html: str, *, prefer_late: bool = False) -> str:
+    candidates: list[tuple[int, int, str]] = []
+
+    for tag_m in _IMG_TAG_RE.finditer(html):
+        tag = tag_m.group(0)
+        attrs = {m.group(1).lower(): unescape(m.group(3)) for m in _ATTR_RE.finditer(tag)}
+        for attr_name in _IMG_SRC_ATTRS:
+            raw = attrs.get(attr_name, "")
+            if not raw:
+                continue
+            if attr_name.endswith("srcset"):
+                raw = _first_srcset_url(raw)
+            url = _normalize_image_url(raw)
+            if not url or not _looks_like_alibaba_product_image(url, attrs):
+                continue
+            score = _score_alibaba_image(url, attrs, attr_name)
+            position = tag_m.start() if prefer_late else -tag_m.start()
+            candidates.append((score, position, url))
+
+    for style_m in _STYLE_URL_RE.finditer(html):
+        url = _normalize_image_url(style_m.group(2))
+        attrs = {"class": html[max(0, style_m.start() - 120):style_m.start()]}
+        if not url or not _looks_like_alibaba_product_image(url, attrs):
+            continue
+        position = style_m.start() if prefer_late else -style_m.start()
+        candidates.append((_score_alibaba_image(url, attrs, "style"), position, url))
+
+    if not candidates:
+        return ""
+    candidates.sort(reverse=True)
+    return candidates[0][2]
+
+
+def _clean_alibaba_text(raw: str) -> str:
+    text = re.sub(r'<[^>]+>', ' ', raw)
+    text = unescape(text)
+    return re.sub(r'\s+', ' ', text).strip()
+
+
+def _alibaba_title_from_href(href: str) -> str:
+    slug = href.split("/product-detail/", 1)[-1].rsplit("_", 1)[0]
+    slug = slug.rsplit("/", 1)[-1]
+    return re.sub(r'[-_]+', ' ', unescape(slug)).strip()
+
+
+def _title_from_alibaba_link_context(html: str, href_match: re.Match) -> str:
+    link_tail = html[href_match.start():min(len(html), href_match.start() + 1200)]
+    anchor_m = re.search(r'<a\b[\s\S]{0,1000}?</a>', link_tail, re.IGNORECASE)
+    if anchor_m:
+        title = _clean_alibaba_text(anchor_m.group(0))
+        if 3 <= len(title) <= 220:
+            return title
+
+    chunk = html[max(0, href_match.start() - 1200):min(len(html), href_match.end() + 2200)]
+    for pattern in (
+        r'<(?:h2|h3)[^>]*>([\s\S]{3,500}?)</(?:h2|h3)>',
+        r'class="[^"]*(?:title|subject|name)[^"]*"[^>]*>([\s\S]{3,500}?)</(?:span|div|a|h2|h3)>',
+        r'\btitle="([^"]{3,220})"',
+    ):
+        m = re.search(pattern, chunk, re.IGNORECASE)
+        if not m:
+            continue
+        title = _clean_alibaba_text(m.group(1))
+        if 3 <= len(title) <= 220 and "alibaba.com" not in title.lower():
+            return title
+
+    return _alibaba_title_from_href(href_match.group(1))
+
+
+def _re_extract_alibaba_from_links(html: str, params: dict, page_num: int) -> list[dict]:
+    results = []
+    seen_ids: set[str] = set()
+    matches = list(_ALIBABA_ANY_HREF_RE.finditer(html))
+
+    for i, m in enumerate(matches):
+        item_id = m.group(2)
+        if item_id in seen_ids:
+            continue
+
+        href = _normalize_href(m.group(1))
+        title = _title_from_alibaba_link_context(html, m)
+        if not title or len(title) < 3:
+            continue
+
+        prev_start = matches[i - 1].start() if i > 0 else max(0, m.start() - 2500)
+        next_start = matches[i + 1].start() if i + 1 < len(matches) else m.end() + 3500
+        chunk = html[max(prev_start, m.start() - 2500):min(len(html), next_start, m.end() + 3500)]
+
+        price_m = _ALIBABA_PRICE_RE.search(chunk)
+        price = price_m.group(1).replace(",", "") if price_m else ""
+        if not price:
+            continue
+
+        image = _best_alibaba_product_image(chunk, prefer_late=True)
+        shop_m = re.search(
+            r'class="[^"]*(?:supplier|company|shop|store)[^"]*"[^>]*>([\s\S]{2,80}?)</(?:span|div|a)>',
+            chunk, re.IGNORECASE,
+        )
+        shop_name = _clean_alibaba_text(shop_m.group(1)) if shop_m else None
+
+        results.append(_enrich_group_category({
+            "itemId":        item_id,
+            "title":         title[:200],
+            "price":         price,
+            "image":         image,
+            "link":          href,
+            "platform":      "alibaba",
+            "searchKeyword": params.get("keyword"),
+            "categoryId":    params.get("categoryId"),
+            "categoryName":  params.get("categoryName"),
+            "pageNumber":    page_num,
+            "language":      params.get("language", DEFAULT_LANGUAGE),
+            "extractedAt":   datetime.now(UTC).isoformat(),
+            "detailsScraped": False,
+            "_extractionMethod": "alibaba_link_fallback",
+            **({"shopName": shop_name} if shop_name else {}),
+        }, params))
+        seen_ids.add(item_id)
+
+    return results
 
 
 def _re_extract_alibaba(html: str, params: dict, page_num: int) -> list[dict]:
@@ -671,6 +887,8 @@ def _re_extract_alibaba(html: str, params: dict, page_num: int) -> list[dict]:
     seen_ids: set[str] = set()
 
     title_matches = list(_ALIBABA_TITLE_RE.finditer(html))
+    if not title_matches:
+        return _re_extract_alibaba_from_links(html, params, page_num)
 
     for i, tm in enumerate(title_matches):
         # Title text is inside <span> within the <h2>
@@ -715,14 +933,22 @@ def _re_extract_alibaba(html: str, params: dict, page_num: int) -> list[dict]:
         if not price:
             continue
 
-        # Image: search backward (slider) first, then forward as fallback.
-        # Alibaba uses src, data-src, and lazy-src for lazy-loaded images.
-        _img_re = re.compile(
-            r'<img[^>]+(?:src|data-src|lazy-src)="((?:https?:|//)[^"]+\.(?:jpg|jpeg|png|webp)[^"]*)"',
-            re.IGNORECASE,
+        # Prefer the image slider scoped to this product. A broad backward scan can
+        # include the previous card's supplier logo, so trim from the nearest
+        # slider/product link before scoring image URLs.
+        product_href = href_m.group(1)
+        slider_pos = back_window.rfind("search-card-e-slider")
+        link_pos = max(
+            back_window.rfind(product_href),
+            back_window.rfind(unescape(product_href)),
+            back_window.rfind(product_href.replace("&", "&amp;")),
         )
-        img_m = _img_re.search(back_window) or _img_re.search(fwd_window)
-        image = _normalize_href(img_m.group(1)) if img_m else ""
+        scoped_back_window = back_window[max(slider_pos, link_pos, 0):]
+        image = (
+            _best_alibaba_product_image(scoped_back_window, prefer_late=True)
+            or _best_alibaba_product_image(back_window, prefer_late=True)
+            or _best_alibaba_product_image(fwd_window)
+        )
 
         # Supplier name
         shop_m = re.search(
@@ -748,7 +974,7 @@ def _re_extract_alibaba(html: str, params: dict, page_num: int) -> list[dict]:
             **({"shopName": shop_name} if shop_name else {}),
         }, params))
 
-    return results
+    return results or _re_extract_alibaba_from_links(html, params, page_num)
 
 
 # ── ScraperService ─────────────────────────────────────────────────────────
@@ -1194,6 +1420,23 @@ class ScraperService:
             "loginname",
             "punish",
             "sec.taobao.com",
+        ]
+        return any(marker in lowered for marker in markers)
+
+    def _looks_like_alibaba_block_page(self, html: str) -> bool:
+        if not html:
+            return True
+        lowered = html.lower()
+        markers = [
+            "baxia-punish",
+            "_____tmd_____",
+            "x5secdata",
+            "slidetounlock",
+            "nc_1_nocaptcha",
+            "captcha-qrcode",
+            "captcha-tips",
+            "punish",
+            "nocaptcha",
         ]
         return any(marker in lowered for marker in markers)
 
@@ -1997,7 +2240,7 @@ class ScraperService:
 
             # Collect image src / data-src / lazy-src from img tags
             img_srcs = re.findall(
-                r'<img[^>]+(?:src|data-src|lazy-src)="((?:https?:|//)[^"]+)"',
+                r'<img[^>]+(?:src|data-src|data-lazy-src|data-original|lazy-src|srcset)="((?:https?:|//)[^"]+)"',
                 html, re.IGNORECASE,
             )[:30]
 
@@ -2043,6 +2286,7 @@ class ScraperService:
         seen_ids: set[str] = set()
         current_page = start_page
         end_page     = start_page + max_pages - 1
+        block_retries = 0
 
         self.log(job_id, f"Starting Alibaba scrape (pages {start_page}→{end_page}): {search_url}")
 
@@ -2070,11 +2314,12 @@ class ScraperService:
                     headless=self.config["headless"],
                     # network_idle=True causes Alibaba timeouts — the page keeps
                     # firing XHR requests and never reaches networkidle.
-                    # Instead wait for the first product card title to appear.
                     network_idle=False,
-                    wait_selector="h2.search-card-e-title",
-                    wait_selector_state="attached",
-                    timeout=60000,
+                    # Avoid waiting for a result selector here: anti-bot pages are
+                    # valid HTTP 200 responses and need to be inspected directly.
+                    disable_resources=True,
+                    load_dom=False,
+                    timeout=30000,
                     extra_headers={"Accept-Language": lang_cfg["accept_language"]},
                 )
                 if cookies:
@@ -2093,6 +2338,24 @@ class ScraperService:
 
                 html = _html_content(page)
                 self.log(job_id, f"  HTML: {len(html):,} chars")
+
+                if self._looks_like_alibaba_block_page(html):
+                    if current_page == start_page:
+                        self._dump_alibaba_debug(html, fetch_url, job_id)
+                    if page_proxy:
+                        proxy_service.mark_failure(page_proxy)
+
+                    block_retries += 1
+                    msg = (
+                        "Alibaba returned a Baxia/nocaptcha anti-bot page instead of search results"
+                    )
+                    if proxy_service.enabled and block_retries < 3:
+                        self.log(job_id, f"  ⚠️  {msg}; retrying with another proxy", "warn")
+                        await self._page_delay(job_id, current_page)
+                        continue
+                    raise RuntimeError(
+                        f"{msg}. Try a different proxy/IP, lower request rate, or run with a fresh browser session."
+                    )
 
                 page_products = self.extract_products_from_page(html, platform, params, current_page)
                 self.log(job_id, f"  Extracted: {len(page_products)}")
@@ -2234,20 +2497,23 @@ class ScraperService:
                         else:
                             link = f"https://item.taobao.com/item.htm?id={item_id}"
 
-                    image = ""
-                    img_el = card.css("img")
-                    if img_el:
-                        src = (img_el.first.attrib.get("src")
-                               or img_el.first.attrib.get("data-src") or "")
-                        if src:
-                            image = _normalize_href(src)
-
                     actual_platform = (
                         "1688" if "1688.com" in link
                         else "alibaba" if "alibaba.com" in link
                         else "tmall" if "tmall.com" in link
                         else "taobao"
                     )
+                    image = ""
+                    if actual_platform == "alibaba":
+                        image = _best_alibaba_product_image(card_html)
+                    else:
+                        img_el = card.css("img")
+                        if img_el:
+                            src = (img_el.first.attrib.get("data-src")
+                                   or img_el.first.attrib.get("data-lazy-src")
+                                   or img_el.first.attrib.get("src") or "")
+                            if src:
+                                image = _normalize_href(src)
 
                     results.append(_enrich_group_category({
                         "itemId": item_id, "title": title[:200], "price": price,

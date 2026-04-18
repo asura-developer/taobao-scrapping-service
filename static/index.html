@@ -1691,6 +1691,90 @@ function scrapeGroup(groupId, nameZh, nameEn) {
 // ═══════════════════════════════════════════════════════════════════════════
 function closeModal() { S.selected = null; document.getElementById('modal-root').innerHTML = ''; }
 
+function modalFormValues(form) {
+    return Object.fromEntries(new FormData(form).entries());
+}
+
+function renderModalActions(actions) {
+    if (!actions?.length) return '';
+    return `<div class="modal-footer">
+      ${actions.map((action, index) => `
+        <button
+          class="btn ${action.className || action.variant || 'btn-ghost'}"
+          id="${esc(action.id || `modal-action-${index}`)}"
+          type="${esc(action.type || 'button')}"
+          ${action.form ? `form="${esc(action.form)}"` : ''}
+          data-modal-action="${index}"
+          ${action.disabled ? 'disabled' : ''}
+        >${esc(action.label || 'OK')}</button>
+      `).join('')}
+    </div>`;
+}
+
+function openModal({
+    title = '',
+    content = '',
+    maxWidth = '780px',
+    actions = [],
+    onMount,
+    onSubmit,
+    submitFormId,
+    closeOnOverlay = true,
+    onClose,
+} = {}) {
+    const root = document.getElementById('modal-root');
+    const close = () => {
+        closeModal();
+        if (onClose) onClose();
+    };
+
+    root.innerHTML = `
+<div class="modal-overlay" id="modal-overlay">
+  <div class="modal" style="max-width:${esc(maxWidth)}">
+    <div class="modal-header">
+      <div class="modal-title">${esc(title)}</div>
+      <button class="modal-close" id="modal-close-btn">\u00d7</button>
+    </div>
+    <div class="modal-body">${content}</div>
+    ${renderModalActions(actions)}
+  </div>
+</div>`;
+
+    const overlay = document.getElementById('modal-overlay');
+    const closeBtn = document.getElementById('modal-close-btn');
+    overlay.addEventListener('click', e => { if (closeOnOverlay && e.target === overlay) close(); });
+    closeBtn.addEventListener('click', close);
+
+    actions.forEach((action, index) => {
+        const button = root.querySelector(`[data-modal-action="${index}"]`);
+        if (!button || !action.onClick) return;
+        button.addEventListener('click', async event => {
+            const result = await action.onClick({ event, root, close });
+            if (action.close === true && result !== false) close();
+        });
+    });
+
+    if (onSubmit) {
+        const form = submitFormId ? document.getElementById(submitFormId) : root.querySelector('form');
+        if (form) {
+            form.addEventListener('submit', async event => {
+                event.preventDefault();
+                const result = await onSubmit({
+                    event,
+                    form,
+                    formData: new FormData(form),
+                    values: modalFormValues(form),
+                    root,
+                    close,
+                });
+                if (result === true) close();
+            });
+        }
+    }
+
+    if (onMount) onMount({ root, close });
+}
+
 function renderModal() {
     const root = document.getElementById('modal-root');
     const captchaJob = S.captchaJobId ? S.jobs.find(j => j.jobId === S.captchaJobId) : null;

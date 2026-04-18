@@ -11,11 +11,44 @@ function getRoot() {
     return modalRoot;
 }
 
+function renderActions(actions) {
+    if (!actions?.length) return '';
+    return `<div class="modal-footer">
+        ${actions.map((action, index) => `
+            <button
+                class="btn ${action.className || action.variant || 'btn-ghost'}"
+                id="${action.id || `modal-action-${index}`}"
+                type="${action.type || 'button'}"
+                ${action.form ? `form="${action.form}"` : ''}
+                data-modal-action="${index}"
+                ${action.disabled ? 'disabled' : ''}
+            >${action.label || 'OK'}</button>
+        `).join('')}
+    </div>`;
+}
+
+function formValues(form) {
+    return Object.fromEntries(new FormData(form).entries());
+}
+
 /**
  * Open a modal with content HTML.
- * @param {object} opts - { title, content, maxWidth, onClose }
+ * Inputs, links, and buttons inside content remain interactive. For callback-based
+ * interactions, pass actions and/or onSubmit.
+ *
+ * @param {object} opts - { title, content, maxWidth, onClose, actions, onMount, onSubmit, submitFormId, closeOnOverlay }
  */
-export function openModal({ title = '', content = '', maxWidth = '780px', onClose } = {}) {
+export function openModal({
+    title = '',
+    content = '',
+    maxWidth = '780px',
+    onClose,
+    actions = [],
+    onMount,
+    onSubmit,
+    submitFormId,
+    closeOnOverlay = true,
+} = {}) {
     const root = getRoot();
     root.innerHTML = `
     <div class="modal-overlay" id="modal-overlay">
@@ -25,6 +58,7 @@ export function openModal({ title = '', content = '', maxWidth = '780px', onClos
                 <button class="modal-close" id="modal-close-btn">\u00d7</button>
             </div>
             <div class="modal-body">${content}</div>
+            ${renderActions(actions)}
         </div>
     </div>`;
 
@@ -36,8 +70,39 @@ export function openModal({ title = '', content = '', maxWidth = '780px', onClos
         if (onClose) onClose();
     };
 
-    overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
+    overlay.addEventListener('click', e => { if (closeOnOverlay && e.target === overlay) close(); });
     closeBtn.addEventListener('click', close);
+
+    actions.forEach((action, index) => {
+        const button = root.querySelector(`[data-modal-action="${index}"]`);
+        if (!button || !action.onClick) return;
+        button.addEventListener('click', async (event) => {
+            const result = await action.onClick({ event, root, close });
+            if (action.close === true && result !== false) close();
+        });
+    });
+
+    if (onSubmit) {
+        const form = submitFormId
+            ? document.getElementById(submitFormId)
+            : root.querySelector('form');
+        if (form) {
+            form.addEventListener('submit', async (event) => {
+                event.preventDefault();
+                const result = await onSubmit({
+                    event,
+                    form,
+                    formData: new FormData(form),
+                    values: formValues(form),
+                    root,
+                    close,
+                });
+                if (result === true) close();
+            });
+        }
+    }
+
+    if (onMount) onMount({ root, close });
 }
 
 /**

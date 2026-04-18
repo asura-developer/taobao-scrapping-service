@@ -2,6 +2,13 @@ from datetime import datetime
 from typing import Optional, Literal, Any
 from pydantic import BaseModel, Field
 
+PRODUCT_TEXT_INDEX_NAME = "products_text_search"
+PRODUCT_TEXT_INDEX_FIELDS = [
+    ("title", "text"),
+    ("detailedInfo.fullDescription", "text"),
+    ("shopName", "text"),
+]
+
 
 class SellerInfo(BaseModel):
     positiveFeedbackRate: Optional[int] = None
@@ -142,6 +149,33 @@ class ScrapingJob(BaseModel):
     updatedAt: datetime = Field(default_factory=datetime.utcnow)
 
 
+def _is_text_index(index: dict) -> bool:
+    key = index.get("key", {})
+    if hasattr(key, "items"):
+        return any(value == "text" for _, value in key.items()) or key.get("_fts") == "text"
+    return False
+
+
+def _text_index_matches(index: dict) -> bool:
+    if index.get("name") != PRODUCT_TEXT_INDEX_NAME:
+        return False
+    weights = index.get("weights") or {}
+    expected_fields = {field for field, kind in PRODUCT_TEXT_INDEX_FIELDS if kind == "text"}
+    return set(weights) == expected_fields
+
+
+async def _ensure_product_text_index(col) -> None:
+    indexes = await col.list_indexes().to_list(length=None)
+    for index in indexes:
+        if not _is_text_index(index):
+            continue
+        if _text_index_matches(index):
+            return
+        await col.drop_index(index["name"])
+
+    await col.create_index(PRODUCT_TEXT_INDEX_FIELDS, name=PRODUCT_TEXT_INDEX_NAME)
+
+
 async def ensure_product_indexes(db):
     col = db.products
     await col.create_index("itemId", unique=True)
@@ -156,9 +190,7 @@ async def ensure_product_indexes(db):
     await col.create_index("contentHash", sparse=True)
     await col.create_index([("enrichmentStatus", 1), ("updatedAt", -1)])
     await col.create_index([("lastSeenAt", -1)])
-    await col.create_index(
-        [("title", "text"), ("detailedInfo.fullDescription", "text"), ("shopName", "text")]
-    )
+    await _ensure_product_text_index(col)
 
 
 async def ensure_enrichment_queue_indexes(db):

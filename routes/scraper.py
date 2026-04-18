@@ -680,22 +680,67 @@ async def start_qr_login(platform: str):
         except Exception:
             pass
 
-    from playwright.async_api import async_playwright
+    from playwright.async_api import TimeoutError as PlaywrightTimeoutError, async_playwright
 
-    pw = await async_playwright().start()
-    browser = await pw.chromium.launch(
-        headless=True,
-        args=["--no-sandbox", "--disable-setuid-sandbox"],
-    )
-    context = await browser.new_context(
-        viewport={"width": 1200, "height": 900},
-        user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    )
-    page = await context.new_page()
+    pw = browser = context = None
+    try:
+        pw = await async_playwright().start()
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox"],
+        )
+        context = await browser.new_context(
+            viewport={"width": 1200, "height": 900},
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        )
+        page = await context.new_page()
 
-    login_url = _LOGIN_URLS.get(platform, _LOGIN_URLS["taobao"])
-    await page.goto(login_url, wait_until="networkidle", timeout=30000)
-    await page.wait_for_timeout(2000)
+        login_url = _LOGIN_URLS.get(platform, _LOGIN_URLS["taobao"])
+        # Login pages keep long-polling/analytics requests open, so
+        # networkidle can time out even when the QR UI is usable.
+        await page.goto(login_url, wait_until="domcontentloaded", timeout=45000)
+        try:
+            await page.wait_for_load_state("load", timeout=10000)
+        except PlaywrightTimeoutError:
+            pass
+        await page.wait_for_timeout(2000)
+    except PlaywrightTimeoutError as e:
+        if browser:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+        if pw:
+            try:
+                await pw.stop()
+            except Exception:
+                pass
+        return JSONResponse(
+            {
+                "success": False,
+                "error": (
+                    f"Timed out opening {platform} login page. "
+                    "The site may be slow, blocked, or waiting on a proxy/VPN. Try again."
+                ),
+                "detail": str(e),
+            },
+            status_code=504,
+        )
+    except Exception as e:
+        if browser:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+        if pw:
+            try:
+                await pw.stop()
+            except Exception:
+                pass
+        return JSONResponse(
+            {"success": False, "error": f"Failed to start QR login for {platform}: {e}"},
+            status_code=500,
+        )
 
     # ── Try to switch to QR code login mode ──────────────────────────
     # Taobao/Tmall/1688 login pages often default to password form;
